@@ -50,7 +50,6 @@ async function ask(model, useSearch, contents, timeout) {
           generationConfig: {
             maxOutputTokens: 250,
             temperature: 0.8,
-            thinkingConfig: { thinkingBudget: 0 },
           },
         }),
       }
