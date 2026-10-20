@@ -1,7 +1,7 @@
 // api/alice.js — вебхук навыка Яндекс Алисы на Gemini
 
-const SMART = "gemini-2.5-flash";
-const LITE  = "gemini-2.5-flash-lite";
+const SMART = "gemini-2.5-flash-preview-05-20";
+const LITE  = "gemini-2.5-flash-lite-preview-06-17";
 
 // Только эти темы требуют поиска и умной модели
 const SEARCH_RE =
