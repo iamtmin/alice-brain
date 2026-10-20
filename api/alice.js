@@ -1,11 +1,15 @@
-// api/alice.js — вебхук навыка Яндекс Алисы на Gemini (с поиском Google для свежих фактов)
+// api/alice.js — вебхук навыка Яндекс Алисы на Gemini
 
 const SMART = "gemini-2.5-flash";
-const LITE = "gemini-2.5-flash-lite";
+const LITE  = "gemini-2.5-flash-lite";
 
-// Если в реплике есть такие слова, подключаем поиск Google
+// Только эти темы требуют поиска и умной модели
 const SEARCH_RE =
-  /новост|сегодня|сейчас|вчера|завтра|послед|свеж|актуальн|курс|погод|цен[аыу]|сколько стоит|кто выиграл|счёт|счет|матч|результат|происходит|случилось|найди|поищи|погугли|в интернете|расписание|когда выйдет|вышел|2025|2026/i;
+  /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс валют|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026/i;
+
+// Сложные вопросы — умная модель без поиска
+const SMART_RE =
+  /объясни|расскажи подробно|почему|как работает|что такое|в чём разница|сравни|проанализируй|напиши|придумай|помоги|посоветуй|рекомендуй/i;
 
 const systemPrompt = () => {
   const now = new Date().toLocaleString("ru-RU", {
@@ -16,21 +20,17 @@ const systemPrompt = () => {
   return (
     "Ты умный, живой и остроумный голосовой собеседник в Яндекс Алисе. " +
     "Можешь обсуждать любые темы: наука, учёба, жизнь, советы, шутки, идеи. " +
-    "Отвечай по-русски, разговорно, 2-4 предложения. Никакого markdown, списков, ссылок и эмодзи: " +
-    "ответ должен хорошо звучать вслух. Если вопрос про новости, цены, события или свежие факты, " +
-    "опирайся на поиск и коротко назови источник. Если не знаешь, так и скажи. " +
+    "Отвечай по-русски, разговорно, 1-3 предложения. Никакого markdown, списков, ссылок и эмодзи: " +
+    "ответ должен хорошо звучать вслух. " +
+    "Если вопрос про новости или свежие события — кратко назови источник. " +
     `Сейчас ${now} по Москве.`
   );
 };
 
 const clean = (t) =>
-  t
-    .replace(/\[\d+(?:,\s*\d+)*\]/g, "")
-    .replace(/[*_#`>]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  t.replace(/\[\d+(?:,\s*\d+)*\]/g, "").replace(/[*_#`>]/g, "").replace(/\s+/g, " ").trim();
 
-async function ask(model, search, contents, timeout) {
+async function ask(model, useSearch, contents, timeout) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
@@ -46,9 +46,9 @@ async function ask(model, search, contents, timeout) {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt() }] },
           contents,
-          tools: search ? [{ google_search: {} }] : undefined,
+          tools: useSearch ? [{ google_search: {} }] : undefined,
           generationConfig: {
-            maxOutputTokens: 350,
+            maxOutputTokens: 250,
             temperature: 0.8,
             thinkingConfig: { thinkingBudget: 0 },
           },
@@ -56,28 +56,22 @@ async function ask(model, search, contents, timeout) {
       }
     );
     const data = await r.json();
-    if (!r.ok) throw new Error(`${model} ${r.status} ${JSON.stringify(data).slice(0, 300)}`);
+    if (!r.ok) throw new Error(`${model} ${r.status} ${JSON.stringify(data).slice(0, 200)}`);
     const text = clean(
       (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("")
     );
-    if (!text) throw new Error(`${model} empty answer`);
+    if (!text) throw new Error(`${model} empty`);
     return text;
   } finally {
     clearTimeout(timer);
   }
 }
 
-const safe = (p) =>
-  p.catch((e) => {
-    console.error(String(e.message || e.name).slice(0, 400));
-    return null;
-  });
-
 module.exports = async (req, res) => {
-  const body = req.body || {};
-  const version = body.version || "1.0";
+  const body      = req.body || {};
+  const version   = body.version || "1.0";
   const utterance = ((body.request && body.request.original_utterance) || "").trim();
-  const history = (body.state && body.state.session && body.state.session.h) || [];
+  const history   = (body.state && body.state.session && body.state.session.h) || [];
 
   const send = (text, end = false, h = history) =>
     res.status(200).json({
@@ -87,22 +81,46 @@ module.exports = async (req, res) => {
     });
 
   if (utterance === "ping") return send("pong");
-  if (!utterance) return send("Привет! Я подключена к Gemini. Спрашивай что угодно, хоть про свежие новости.");
+  if (!utterance)
+    return send("Привет! Я подключена к Gemini. Спрашивай что угодно, хоть про свежие новости.");
   if (/^(хватит|стоп|выход|выйти|пока|закрой)\.?$/i.test(utterance))
     return send("Хорошо, до связи!", true);
 
   const contents = [...history, { role: "user", parts: [{ text: utterance }] }];
+
   const wantsSearch = SEARCH_RE.test(utterance);
+  const wantsSmart  = SMART_RE.test(utterance);
 
-  // Запасной быстрый ответ стартует параллельно, чтобы успеть в лимит Яндекса (~4,5 с)
-  const lite = safe(ask(LITE, false, contents, 3700));
+  let answer = null;
 
-  let answer = wantsSearch
-    ? await safe(ask(SMART, true, contents, 3600))
-    : await safe(ask(SMART, false, contents, 2700));
-  if (!answer) answer = await lite;
+  if (wantsSearch) {
+    // Новости/факты: пробуем умную с поиском, запасной — lite без поиска параллельно
+    const [smart, lite] = await Promise.allSettled([
+      ask(SMART, true,  contents, 3800),
+      ask(LITE,  false, contents, 3800),
+    ]);
+    answer = smart.status === "fulfilled" ? smart.value : null;
+    if (!answer) answer = lite.status === "fulfilled" ? lite.value : null;
 
-  if (!answer) return send("Я не успела подумать. Повтори вопрос, пожалуйста.");
+  } else if (wantsSmart) {
+    // Сложный вопрос: умная без поиска, запасной lite параллельно
+    const [smart, lite] = await Promise.allSettled([
+      ask(SMART, false, contents, 3800),
+      ask(LITE,  false, contents, 3800),
+    ]);
+    answer = smart.status === "fulfilled" ? smart.value : null;
+    if (!answer) answer = lite.status === "fulfilled" ? lite.value : null;
+
+  } else {
+    // Простой разговор (привет, как дела, шутка и т.д.) — сразу lite, быстро
+    try {
+      answer = await ask(LITE, false, contents, 3800);
+    } catch (e) {
+      console.error("lite failed:", String(e).slice(0, 200));
+    }
+  }
+
+  if (!answer) return send("Что-то пошло не так, повтори, пожалуйста.");
 
   const newHistory = [...contents, { role: "model", parts: [{ text: answer }] }].slice(-8);
   return send(answer, false, newHistory);
