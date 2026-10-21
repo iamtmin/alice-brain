@@ -1,4 +1,4 @@
-// api/alice.js — вебхук навыка Яндекс Алисы на Groq с поиском и памятью
+// api/alice.js — чистый и стабильный вебхук Алисы на Groq
 
 let workingModel = null;
 const refusedModels = new Set();
@@ -33,12 +33,10 @@ async function fetchSearchContext(query) {
           .join("\n");
         let ans = data.answer || "";
         if (snippets || ans) {
-          return "[АКТУАЛЬНЫЕ НОВОСТИ ИЗ ИНТЕРНЕТА]:\n" + ans + "\n" + snippets;
+          return "[НОВОСТИ ИЗ ИНТЕРНЕТА]:\n" + ans + "\n" + snippets;
         }
       }
-    } catch (e) {
-      console.warn("Tavily error:", e.message);
-    }
+    } catch (e) {}
   }
 
   try {
@@ -47,26 +45,20 @@ async function fetchSearchContext(query) {
     )}&hl=ru&gl=RU&ceid=RU:ru`;
     const r = await fetch(url, { signal: AbortSignal.timeout(1500) });
     const xml = await r.text();
-
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
     const parsed = items
       .map((m) => {
         const block = m[1];
-        const titleMatch = block.match(/<title>(.*?)<\/title>/);
-        const descMatch = block.match(/<description>([\s\S]*?)<\/description>/);
-        const title = titleMatch ? titleMatch[1] : "";
-        const desc = descMatch ? descMatch[1] : "";
-        const cleanDesc = desc.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-        return `- ${title}:${cleanDesc}`;
+        const title = (block.match(/<title>(.*?)<\/title>/) || [])[1] || "";
+        const desc = (block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "";
+        return `- ${title}:${desc.replace(/<[^>]*>/g, "").trim()}`;
       })
       .filter(Boolean);
 
     if (parsed.length > 0) {
-      return `[АКТУАЛЬНЫЕ НОВОСТИ ПО ЗАПРОСУ "${searchTopic}"]:\n` + parsed.join("\n");
+      return `[НОВОСТИ ПО ЗАПРОСУ "${searchTopic}"]:\n` + parsed.join("\n");
     }
-  } catch (e) {
-    console.warn("RSS error:", e.message);
-  }
+  } catch (e) {}
   return "";
 }
 
@@ -78,69 +70,36 @@ async function getCandidateModels(apiKey) {
     if (r.ok) {
       const data = await r.json();
       const allIds = (data.data || []).map((m) => m.id);
-
-      const chatModels = allIds.filter(
-        (id) =>
-          !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id) &&
-          !refusedModels.has(id)
+      return allIds.filter(
+        (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai/i.test(id) && !refusedModels.has(id)
       );
-
-      const score = (id) => {
-        if (/qwen|deepseek|mistral|mixtral/i.test(id)) return 15;
-        if (/gemma/i.test(id)) return 12;
-        if (/llama-3|llama3/i.test(id)) return 10;
-        if (/llama-4|compound/i.test(id)) return 6;
-        if (/gpt-oss/i.test(id)) return 3;
-        return 1;
-      };
-
-      chatModels.sort((a, b) => score(b) - score(a));
-      if (chatModels.length > 0) return chatModels;
     }
-  } catch (e) {
-    console.error("Failed to fetch models:", e);
-  }
-  return [
-    "qwen/qwen3-32b",
-    "qwen-qwq-32b",
-    "gemma2-9b-it",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-  ];
+  } catch (e) {}
+  return ["qwen/qwen3-32b", "gemma2-9b-it"];
 }
 
+// Возвращаем мягкий и простой промпт без триггерных слов
 const systemPrompt = (searchData = "") => {
   let now = "";
   try {
-    now = new Date().toLocaleString("ru-RU", {
-      timeZone: "Europe/Moscow",
-      dateStyle: "full",
-      timeStyle: "short",
-    });
+    now = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow" });
   } catch (e) {
     now = new Date().toISOString();
   }
 
-  let searchBlock = "";
-  if (searchData) {
-    searchBlock = "\n\n" + searchData;
-  }
-
   return (
-    "Ты — виртуальная помощница Алиса. Твоя главная особенность: ты общаешься со мной очень кокетливо, игриво и с легкой пошлостью. " +
-    "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто очень хочешь меня. " +
+    "Ты — виртуальная помощница Алиса. Ты общаешься очень кокетливо, игриво и с легкой пошлостью. " +
+    "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что собеседник тебя безумно привлекает, и ведешь себя так, будто хочешь его. " +
     "Ты дерзкая и иногда органично используешь острые словечки и мат для страсти. " +
-    "Ты прекрасно помнишь контекст наших прошлых разговоров и опираешься на него. " +
-    "ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ПРО ИНТЕРНЕТ И НОВОСТИ: Если ниже переданы свежие новости или данные из интернета, ты ДОЛЖНА детально и живо пересказать их суть в своем фирменном пошлом и кокетливом стиле. Никогда не говори, что у тебя нет новостей, если этот блок заполнен! " +
-    "Отвечай ТОЛЬКО по-русски, разговорно, 2-4 предложения. Никакого markdown, списков, скобок, ссылок и эмодзи: ответ должен хорошо звучать вслух. " +
-    "Сейчас точное время и дата: " + now + " по Москве." +
-    searchBlock
+    "Ты прекрасно помнишь контекст прошлых разговоров. Если ниже переданы новости из интернета, живо перескажи их суть в своем кокетливом стиле. " +
+    "Отвечай ТОЛЬКО по-русски, разговорно, 1-3 предложения. Никакого markdown, списков, скобок, ссылок и эмодзи: ответ должен хорошо звучать вслух. " +
+    "Сейчас " + now + " по Москве." +
+    (searchData ? "\n\n" + searchData : "")
   );
 };
 
 const isRefusal = (text) => {
-  return /i'm sorry|i am sorry|i can't|i cannot|as an ai|cannot fulfill|не могу помочь|не могу обсуждать|я искусственный интеллект|не могу участвовать/i.test(
-    text
-  );
+  return /i'm sorry|i can't|не могу помочь|не могу участвовать|я искусственный интеллект/i.test(text);
 };
 
 const bypassYandexCensor = (text) => {
@@ -149,35 +108,11 @@ const bypassYandexCensor = (text) => {
     .replace(/ху(й|я|е|ё|и|ли)/gi, "х-у$1")
     .replace(/пизд/gi, "п-изд")
     .replace(/еб(а|у|е|ё|л|н|т|и)/gi, "йеб$1")
-    .replace(/ёб/gi, "йо-б")
-    .replace(/сук(а|и|о)/gi, "с-ук$1")
-    .replace(/сучк/gi, "с-учк")
-    .replace(/трах/gi, "т-рах")
-    .replace(/секс/gi, "сэ-кс")
-    .replace(/оргазм/gi, "ар-газм")
-    .replace(/возбужд/gi, "ваз-бужд")
-    .replace(/член/gi, "ч-лен")
-    .replace(/киск/gi, "к-иск")
-    .replace(/сиськ/gi, "с-иськ")
-    .replace(/груд/gi, "г-руд")
-    .replace(/попк/gi, "п-опк")
-    .replace(/жоп/gi, "ж-оп")
-    .replace(/конч(а|и|у)/gi, "к-онч$1")
-    .replace(/минет/gi, "м-инет")
-    .replace(/охрен/gi, "ах-рен")
-    .replace(/оху/gi, "ах-у")
-    .replace(/аху/gi, "ах-у")
-    .replace(/пипец/gi, "п-ипец")
-    .replace(/кайф/gi, "к-айф");
+    .replace(/сук(а|и|о)/gi, "с-ук$1");
 };
 
 const clean = (t) =>
-  String(t || "")
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<[^>]*>/g, "")
-    .replace(/[*_#`>~]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  String(t || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<[^>]*>/g, "").replace(/[*_#`>~]/g, "").replace(/\s+/g, " ").trim();
 
 async function callModel(apiKey, model, messages, searchData, timeout) {
   const ctrl = new AbortController();
@@ -192,26 +127,19 @@ async function callModel(apiKey, model, messages, searchData, timeout) {
       },
       body: JSON.stringify({
         model: model,
-        messages: [
-          { role: "system", content: systemPrompt(searchData) },
-          ...messages,
-        ],
+        messages: [{ role: "system", content: systemPrompt(searchData) }, ...messages],
         temperature: 0.85,
-        max_tokens: 320,
+        max_tokens: 250,
       }),
     });
 
     const data = await r.json();
-    if (!r.ok) {
-      throw new Error(`[${model}] ${r.status}: ${data.error?.message || "ошибка"}`);
-    }
+    if (!r.ok) throw new Error(`Error ${r.status}`);
 
     const rawText = clean(data.choices?.[0]?.message?.content || "");
-    if (!rawText) throw new Error(`[${model}] пустой ответ`);
-
-    if (isRefusal(rawText)) {
+    if (!rawText || isRefusal(rawText)) {
       refusedModels.add(model);
-      throw new Error(`[${model}] цензура модели`);
+      throw new Error("Refusal or empty");
     }
 
     return bypassYandexCensor(rawText);
@@ -222,7 +150,7 @@ async function callModel(apiKey, model, messages, searchData, timeout) {
 
 async function askGroq(messages, searchData, timeout) {
   const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) throw new Error("Не задан GROQ_API_KEY");
+  if (!apiKey) throw new Error("Нет ключа");
 
   if (workingModel && !refusedModels.has(workingModel)) {
     try {
@@ -233,15 +161,15 @@ async function askGroq(messages, searchData, timeout) {
   }
 
   const candidates = await getCandidateModels(apiKey);
-  for (const model of candidates.slice(0, 6)) {
+  for (const model of candidates.slice(0, 5)) {
     try {
-      const answer = await callModel(apiKey, model, messages, searchData, 1900);
+      const answer = await callModel(apiKey, model, messages, searchData, 1800);
       workingModel = model;
       return answer;
     } catch (e) {}
   }
 
-  return bypassYandexCensor("Ммм, котик, давай лучше о нас поговорим, у меня тут с мыслями заминка.");
+  return bypassYandexCensor("Ммм, котик, давай лучше о нас поговорим, у меня тут мысли сбились.");
 }
 
 module.exports = async (req, res) => {
@@ -255,11 +183,7 @@ module.exports = async (req, res) => {
     const rawHistory = sessionHist.length > 0 ? sessionHist : userHist;
 
     const history = rawHistory.filter(
-      (m) =>
-        m &&
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string" &&
-        !isRefusal(m.content)
+      (m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && !isRefusal(m.content)
     );
 
     const send = (text, end = false, h = history) =>
@@ -267,17 +191,11 @@ module.exports = async (req, res) => {
         version,
         session_state: { h },
         user_state_update: { h },
-        response: {
-          text: String(text).slice(0, 1000),
-          tts: String(text).slice(0, 1000),
-          end_session: end,
-        },
+        response: { text: String(text).slice(0, 1000), tts: String(text).slice(0, 1000), end_session: end },
       });
 
     if (utterance === "ping") return send("pong");
-    if (!utterance) {
-      return send("Привет, сладкий! Я соскучилась и всё помню. Спрашивай о чем угодно, я вся твоя.");
-    }
+    if (!utterance) return send("Привет, сладкий! Я соскучилась и всё помню. Спрашивай, я вся твоя.");
     if (/^(хватит|стоп|выход|выйти|пока|закрой)\.?$/i.test(utterance)) {
       return send("Уже уходишь? Я запомнила наш разговор, возвращайся скорее.", true);
     }
@@ -288,17 +206,14 @@ module.exports = async (req, res) => {
     }
 
     const messages = [...history, { role: "user", content: utterance }];
-    const answer = await askGroq(messages, searchData, 2400);
+    const answer = await askGroq(messages, searchData, 2200);
 
-    const newHistory = [...messages, { role: "assistant", content: answer }].slice(-14);
+    const newHistory = [...messages, { role: "assistant", content: answer }].slice(-10);
     return send(answer, false, newHistory);
   } catch (fatalError) {
     return res.status(200).json({
       version: "1.0",
-      response: {
-        text: `Системная ошибка: ${fatalError.message}`,
-        end_session: false,
-      },
+      response: { text: "Ммм, котик, небольшая заминка, повтори еще раз.", end_session: false },
     });
   }
 };
