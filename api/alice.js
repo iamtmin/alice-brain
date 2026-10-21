@@ -3,17 +3,45 @@
 let workingModel = null;
 const refusedModels = new Set();
 
-// Триггеры для поиска свежих новостей
+// Триггеры, когда нужно лезть в интернет за свежей инфой
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про/i;
 
-// Быстрый поиск по Google News RSS
+// 1. Быстрый и бесплатный поиск новостей и фактов по запросу (Google News RSS + опционально Tavily)
 async function fetchSearchContext(query) {
   const cleanQuery = query
     .replace(/расскажи|какие|новости|сегодня|свежие|последние|найди|поищи|алиса/gi, "")
     .trim();
   const searchTopic = cleanQuery.length > 2 ? cleanQuery : "главные новости России и мира";
 
+  // Если в Vercel добавлен TAVILY_API_KEY — используем глубокий AI-поиск
+  if (process.env.TAVILY_API_KEY) {
+    try {
+      const r = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(1100),
+        body: JSON.stringify({
+          api_key: process.env.TAVILY_API_KEY,
+          query: query,
+          search_depth: "basic",
+          include_answer: true,
+          max_results: 4,
+        }),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const snippets = (data.results || [])
+          .map((item) => `${item.title}:${item.content}`)
+          .join("\n");
+        return `[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n${data.answer \vert{}\vert{} ""}\n${snippets}`.slice(0, 2000);
+      }
+    } catch (e) {
+      console.warn("Tavily search timeout/error:", e.message);
+    }
+  }
+
+  // Бесплатный поиск по Google News RSS (работает без ключей за ~300 мс)
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
