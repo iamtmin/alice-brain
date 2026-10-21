@@ -1,47 +1,43 @@
-// api/alice.js — безотказный вебхук навыка Яндекс Алисы на Groq
+// api/alice.js — вебхук навыка Яндекс Алисы на Groq с умным подбором рабочей модели
 
-let cachedModel = null;
+let workingModel = null;
 
-// Автоматически находим лучшую доступную модель на аккаунте Groq (чтобы никогда не было ошибки 404)
-async function getAvailableModel(apiKey) {
-  if (cachedModel) return cachedModel;
+// Получаем список только текстовых чат-моделей с твоего аккаунта Groq
+async function getCandidateModels(apiKey) {
   try {
     const r = await fetch("https://api.groq.com/openai/v1/models", {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     if (r.ok) {
       const data = await r.json();
-      const ids = (data.data || [])
-        .map((m) => m.id)
-        .filter((id) => !/whisper|guard|tts|vision|embed|audio/i.test(id));
+      const allIds = (data.data || []).map((m) => m.id);
 
-      // Приоритет лучших чат-моделей
-      const preferred = [
-        "qwen/qwen3-32b",
-        "llama-3.3-70b-versatile",
-        "qwen-qwq-32b",
-        "gemma2-9b-it",
-        "llama-3.1-8b-instant",
-        "llama3-70b-8192",
-        "llama3-8b-8192",
-        "mixtral-8x7b-32768",
-      ];
+      // Отсекаем озвучку (orpheus, playai), распознавание речи (whisper) и модерацию (guard)
+      const chatModels = allIds.filter(
+        (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
+      );
 
-      for (const p of preferred) {
-        if (ids.includes(p)) {
-          cachedModel = p;
-          return p;
-        }
-      }
-      if (ids.length > 0) {
-        cachedModel = ids[0];
-        return cachedModel;
-      }
+      // Сортируем так, чтобы самые умные и быстрые модели шли первыми
+      const score = (id) => {
+        if (/llama-4|qwen.*32b|gpt-oss-120b|deepseek/i.test(id)) return 10;
+        if (/llama.*70b|qwen|compound|gpt-oss/i.test(id)) return 8;
+        if (/llama|gemma|mixtral|mistral/i.test(id)) return 5;
+        return 1;
+      };
+
+      chatModels.sort((a, b) => score(b) - score(a));
+      if (chatModels.length > 0) return chatModels;
     }
   } catch (e) {
     console.error("Failed to fetch models:", e);
   }
-  return "llama-3.1-8b-instant";
+  return [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "qwen-qwq-32b",
+    "gemma2-9b-it",
+    "compound-beta-mini",
+  ];
 }
 
 const systemPrompt = () => {
@@ -71,16 +67,9 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-async function askGroq(messages, timeout) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
-    throw new Error("Не задан GROQ_API_KEY в настройках Vercel");
-  }
-
-  const model = await getAvailableModel(apiKey);
+async function callModel(apiKey, model, messages, timeout) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
-
   try {
     const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -99,20 +88,52 @@ async function askGroq(messages, timeout) {
 
     const data = await r.json();
     if (!r.ok) {
-      cachedModel = null; // Сбрасываем кэш модели при ошибке
-      throw new Error(`Код ${r.status}: ${data.error?.message || "ошибка API"}`);
+      throw new Error(`[${model}] ${r.status}: ${data.error?.message || "ошибка"}`);
     }
 
     const text = clean(data.choices?.[0]?.message?.content || "");
-    if (!text) throw new Error("Пустой ответ от нейросети");
+    if (!text) throw new Error(`[${model}] пустой ответ`);
     return text;
   } finally {
     clearTimeout(timer);
   }
 }
 
+async function askGroq(messages, timeout) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error("Не задан GROQ_API_KEY в настройках Vercel");
+  }
+
+  // Если мы уже нашли рабочую модель в прошлых запросах — сразу бьем в нее
+  if (workingModel) {
+    try {
+      return await callModel(apiKey, workingModel, messages, timeout);
+    } catch (e) {
+      console.warn("Cached model failed, searching for another:", e.message);
+      workingModel = null;
+    }
+  }
+
+  // Иначе перебираем доступные чат-модели, пока не найдем ту, что отвечает без ошибок
+  const candidates = await getCandidateModels(apiKey);
+  let lastError = "Нет доступных текстовых моделей";
+
+  for (const model of candidates.slice(0, 5)) {
+    try {
+      const answer = await callModel(apiKey, model, messages, 2200);
+      workingModel = model; // Запоминаем успешную модель!
+      return answer;
+    } catch (e) {
+      lastError = e.message;
+      console.warn("Model skipped:", e.message);
+    }
+  }
+
+  throw new Error(lastError);
+}
+
 module.exports = async (req, res) => {
-  // Глобальный перехват ошибок — сервер НИКОГДА не упадет с ошибкой 500
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const version = body.version || "1.0";
