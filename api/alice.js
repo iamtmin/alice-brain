@@ -1,4 +1,4 @@
-// api/alice.js — вебхук Яндекс Алисы на Groq с быстрым веб-поиском и долгосрочной памятью
+// api/alice.js — вебхук навыка Яндекс Алисы на Groq с быстрым веб-поиском и долгосрочной памятью
 
 let workingModel = null;
 const refusedModels = new Set();
@@ -268,7 +268,6 @@ module.exports = async (req, res) => {
     const version = body.version || "1.0";
     const utterance = String(body.request?.original_utterance || "").trim();
 
-    // Достаем историю и из текущей сессии, и из постоянного хранилища пользователя (между запусками)
     const sessionHist = Array.isArray(body.state?.session?.h) ? body.state.session.h : [];
     const userHist = Array.isArray(body.state?.user?.h) ? body.state.user.h : [];
     const rawHistory = sessionHist.length > 0 ? sessionHist : userHist;
@@ -281,7 +280,6 @@ module.exports = async (req, res) => {
         !isRefusal(m.content)
     );
 
-    // Сохраняем контекст И в сессию, И в постоянную память аккаунта Яндекса (user_state_update)
     const send = (text, end = false, h = history) =>
       res.status(200).json({
         version,
@@ -302,7 +300,6 @@ module.exports = async (req, res) => {
       return send("Уже уходишь? Я запомнила наш разговор, возвращайся скорее.", true);
     }
 
-    // Если вопрос про новости/свежие события — быстро подтягиваем данные из интернета
     let searchData = "";
     if (SEARCH_RE.test(utterance)) {
       searchData = await fetchSearchContext(utterance);
@@ -324,7 +321,6 @@ module.exports = async (req, res) => {
       return send(`Ммм, котик, техническая заминка: ${errorMsg}`);
     }
 
-    // Храним последние 14 сообщений (7 пар вопрос-ответ), чтобы хорошо помнить контекст
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-14);
     return send(answer, false, newHistory);
   } catch (fatalError) {
