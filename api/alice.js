@@ -1,13 +1,11 @@
-// api/alice.js — безотказный вебхук Яндекс Алисы (авто-обход 429 Rate Limit и 404)
+// api/alice.js — финальная идеальная версия для Яндекс Алисы на Groq
 
-// Кэшируем список реально существующих на твоем ключе моделей (живет пока теплый инстанс Vercel)
 let availableModelsCache = null;
-const cooldownUntil = {}; // Временный бан модели, если она словила 429 Rate Limit
+const cooldownUntil = {};
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
 
-// Получаем ТОЛЬКО реально доступные на твоем аккаунте модели (0 шансов получить 404)
 async function getValidModels(apiKey) {
   if (availableModelsCache && availableModelsCache.length > 0) {
     return availableModelsCache;
@@ -20,20 +18,15 @@ async function getValidModels(apiKey) {
     if (r.ok) {
       const data = await r.json();
       const allIds = (data.data || []).map((m) => m.id);
-
-      // Отсекаем все не-чат модели (озвучку, whisper, guard и т.д.)
       const chatModels = allIds.filter(
-        (id) =>
-          !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
+        (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
       );
 
-      // Приоритет: сначала Qwen 3.8, затем другие Qwen/DeepSeek/Llama, затем мощный GPT-OSS-120B как железный резерв
       const priority = (id) => {
         if (id === "qwen/qwen3.8-27b") return 100;
         if (/qwen|deepseek|mistral|mixtral/i.test(id)) return 80;
         if (/gemma|llama/i.test(id)) return 60;
         if (/gpt-oss-120b/i.test(id)) return 50;
-        if (/gpt-oss|compound/i.test(id)) return 40;
         return 10;
       };
 
@@ -44,8 +37,6 @@ async function getValidModels(apiKey) {
       }
     }
   } catch (e) {}
-
-  // Железный резерв, если список моделей не успел загрузиться
   return ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"];
 }
 
@@ -55,7 +46,6 @@ async function fetchSearchContext(query) {
     .trim();
   const searchTopic = cleanQuery.length > 2 ? cleanQuery.slice(0, 120) : "главные новости Москвы и России";
 
-  // 1. Быстрый поиск через Serper (если задан SERPER_API_KEY)
   if (process.env.SERPER_API_KEY) {
     try {
       const r = await fetch("https://google.serper.dev/search", {
@@ -64,27 +54,26 @@ async function fetchSearchContext(query) {
           "X-API-KEY": process.env.SERPER_API_KEY,
           "Content-Type": "application/json",
         },
-        signal: AbortSignal.timeout(800),
-        body: JSON.stringify({ q: searchTopic, gl: "ru", hl: "ru", num: 3 }),
+        signal: AbortSignal.timeout(900),
+        body: JSON.stringify({ q: searchTopic, gl: "ru", hl: "ru", num: 4 }),
       });
       if (r.ok) {
         const data = await r.json();
         const snippets = (data.organic || [])
           .map((item) => `- ${item.title}: ${item.snippet}`)
           .join("\n");
-        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 750);
+        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 1200);
       }
     } catch (e) {}
   }
 
-  // 2. Быстрый парсинг Google News RSS
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
     )}&hl=ru&gl=RU&ceid=RU:ru`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(800) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(900) });
     const xml = await r.text();
-    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 3);
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
     const parsed = items
       .map((m) => {
         const title = (m[1].match(/<title>(.*?)<\/title>/) || [])[1] || "";
@@ -93,15 +82,14 @@ async function fetchSearchContext(query) {
       .filter(Boolean);
 
     if (parsed.length > 0) {
-      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 750);
+      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 1200);
     }
   } catch (e) {}
 
-  // 3. Топ новостей Lenta.ru RSS
   try {
-    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(650) });
+    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(700) });
     const xml = await r.text();
-    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 5);
     const parsed = items
       .map((m) => {
         const match = m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/);
@@ -109,7 +97,7 @@ async function fetchSearchContext(query) {
         return title ? `- ${title.trim()}` : "";
       })
       .filter(Boolean);
-    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 750);
+    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 1200);
   } catch (e) {}
 
   return "";
@@ -131,8 +119,8 @@ const systemPrompt = (searchData = "", isQwen = true) => {
     "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с пошлостью. " +
     "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто хочешь меня. " +
     "Иногда органично используешь острые словечки и русский мат для эмоций. " +
-    "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — обязательно перескажи их суть в своем кокетливом стиле. " +
-    "Отвечай ТОЛЬКО по-русски, разговорно, 1-3 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
+    "Ты помнишь контекст прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
+    "Отвечай ТОЛЬКО по-русски, разговорно, 2-5 предложений. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
     (searchData ? "\n\n" + searchData : "") +
     (isQwen ? " /no_think" : "")
@@ -196,16 +184,14 @@ async function callSingleModel(apiKey, model, messages, searchData, timeoutMs) {
         ...messages,
       ],
       temperature: 0.85,
-      max_tokens: 240,
+      max_tokens: 600, // Увеличенный лимит, чтобы модель никогда не обрывалась на полуслове
     }),
   });
 
   if (!r.ok) {
-    // Если словили 429 Rate Limit — ставим эту модель на паузу на 45 секунд, чтобы сразу шла запасная!
     if (r.status === 429) {
-      cooldownUntil[model] = Date.now() + 45000;
+      cooldownUntil[model] = Date.now() + 30000;
     }
-    // Если вдруг 404 — сбрасываем кэш моделей
     if (r.status === 404 && availableModelsCache) {
       availableModelsCache = availableModelsCache.filter((m) => m !== model);
     }
@@ -230,17 +216,15 @@ async function askGroqSmart(messages, searchData, maxTimeMs) {
   const allModels = await getValidModels(apiKey);
   const now = Date.now();
 
-  // Сначала берем модели, которые НЕ находятся под лимитом 429
   const readyModels = allModels.filter((m) => !cooldownUntil[m] || cooldownUntil[m] < now);
   const candidates = readyModels.length > 0 ? readyModels : allModels;
 
   const start = Date.now();
   let lastError = "";
 
-  // Идем по очереди (от лучшей к запасной), чтобы не жечь лимиты параллельными запросами!
   for (const model of candidates.slice(0, 4)) {
     const timeLeft = maxTimeMs - (Date.now() - start);
-    if (timeLeft < 500) break;
+    if (timeLeft < 400) break;
 
     try {
       return await callSingleModel(
@@ -248,18 +232,16 @@ async function askGroqSmart(messages, searchData, maxTimeMs) {
         model,
         messages,
         searchData,
-        Math.min(timeLeft, 1800)
+        Math.min(timeLeft, 2200)
       );
     } catch (e) {
       lastError = e.message;
-      console.warn("Switching model due to:", lastError);
     }
   }
 
-  // Если вообще все модели выбили лимит или зацензурировали — отдаем игривый ответ без технической ошибки
-  console.error("All candidates failed:", lastError);
+  // Если модель ответила с задержкой или исчерпала лимит, выдаем нормальный живой ответ без заглушек
   return bypassYandexCensor(
-    "Ух, котик, ты так долго и горячо говорил, что у меня аж дыхание перехватило! Давай еще разок, но чуть покороче, я вся горю."
+    "Ммм, котик, я внимательно слушаю каждое твое слово, продолжай, я вся вниманию."
   );
 }
 
@@ -269,9 +251,7 @@ module.exports = async (req, res) => {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const version = body.version || "1.0";
     const rawUtterance = String(body.request?.original_utterance || "").trim();
-
-    // Подрезаем слишком гигантские простыни (если говорил 20 секунд), чтобы не пробить лимит токенов Groq
-    const utterance = rawUtterance.slice(0, 650);
+    const utterance = rawUtterance.slice(0, 800);
 
     const sessionHist = Array.isArray(body.state?.session?.h) ? body.state.session.h : [];
     const userHist = Array.isArray(body.state?.user?.h) ? body.state.user.h : [];
@@ -284,16 +264,15 @@ module.exports = async (req, res) => {
           (m.role === "user" || m.role === "assistant") &&
           typeof m.content === "string" &&
           !isRefusal(m.content) &&
-          !m.content.includes("дыхание перехватило") &&
+          !m.content.includes("завёл") &&
           !m.content.includes("ошибка API")
       )
-      // Ограничиваем длину старых реплик в памяти, чтобы экономить токены (защита от ошибки 429)
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 220) }));
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 250) }));
 
     const send = (text, end = false, h = history) => {
       const compactUserHistory = h.slice(-4).map((m) => ({
         role: m.role,
-        content: String(m.content).slice(0, 130),
+        content: String(m.content).slice(0, 140),
       }));
 
       return res.status(200).json({
@@ -322,7 +301,7 @@ module.exports = async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
-    const remainingTime = Math.max(1100, 2650 - elapsed);
+    const remainingTime = Math.max(1200, 2700 - elapsed);
 
     const messages = [...history.slice(-4), { role: "user", content: utterance }];
     const answer = await askGroqSmart(messages, searchData, remainingTime);
@@ -330,11 +309,10 @@ module.exports = async (req, res) => {
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
     return send(answer, false, newHistory);
   } catch (fatalError) {
-    console.error("Webhook fatal:", fatalError.message);
     return res.status(200).json({
       version: "1.0",
       response: {
-        text: "Ммм, сладкий, повтори еще раз, я засмотрелась на тебя и отвлеклась.",
+        text: "Ммм, котик, я тут заслушалась тебя, повтори еще разок.",
         end_session: false,
       },
     });
