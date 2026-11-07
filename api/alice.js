@@ -1,6 +1,6 @@
-// api/alice.js — вебхук Алисы через официальный Vertex/OAuth эндпоинт Google для ключей AQ.
+// api/alice.js — вебхук Алисы через официальный Google Cloud Vertex/OAuth эндпоинт
 
-const GEMINI_KEY = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
+const AUTH_TOKEN = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
@@ -131,10 +131,10 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-async function callGemini(messages, searchData, timeoutMs) {
+async function callGeminiOAuth(messages, searchData, timeoutMs) {
   const fullPrompt = systemPrompt(searchData) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
 
-  // Передаем токен через Bearer заголовок на стандартный генеративный эндпоинт
+  // Используем OAuth Bearer токен для Vertex AI / Google Cloud эндпоинта
   const r = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent`,
     {
@@ -142,7 +142,8 @@ async function callGemini(messages, searchData, timeoutMs) {
       signal: AbortSignal.timeout(timeoutMs),
       headers: { 
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${GEMINI_KEY}`
+        "Authorization": `Bearer ${AUTH_TOKEN}`,
+        "X-Goog-User-Project": "398207170903" // Проект ID из твоего скриншота
       },
       body: JSON.stringify({
         contents: [{ parts: [{ text: fullPrompt }] }],
@@ -153,7 +154,7 @@ async function callGemini(messages, searchData, timeoutMs) {
 
   if (!r.ok) {
     const errData = await r.text();
-    throw new Error(`Gemini HTTP ${r.status}: ${errData.slice(0, 90)}`);
+    throw new Error(`Gemini OAuth HTTP ${r.status}: ${errData.slice(0, 90)}`);
   }
 
   const data = await r.json();
@@ -221,7 +222,7 @@ module.exports = async (req, res) => {
     const remainingTime = Math.max(1200, 2600 - elapsed);
 
     const messages = [...history.slice(-4), { role: "user", content: utterance }];
-    const answer = await callGemini(messages, searchData, remainingTime);
+    const answer = await callGeminiOAuth(messages, searchData, remainingTime);
 
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
     return send(answer, false, newHistory);
