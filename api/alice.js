@@ -1,4 +1,4 @@
-// api/alice.js — вебхук Алисы на официальном Gemini API с поддержкой ключей AQ.
+// api/alice.js — вебхук Алисы через официальный Vertex/OAuth эндпоинт Google для ключей AQ.
 
 const GEMINI_KEY = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
 
@@ -134,9 +134,9 @@ const clean = (t) =>
 async function callGemini(messages, searchData, timeoutMs) {
   const fullPrompt = systemPrompt(searchData) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
 
-  // Пробуем передать ключ и как query-параметр, и как Bearer токен в заголовках
+  // Передаем токен через Bearer заголовок на стандартный генеративный эндпоинт
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent`,
     {
       method: "POST",
       signal: AbortSignal.timeout(timeoutMs),
