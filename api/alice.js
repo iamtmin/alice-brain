@@ -1,6 +1,6 @@
-// api/alice.js — вебхук Алисы через официальный Google Cloud Vertex/OAuth эндпоинт
+// api/alice.js — финальный рабочий вебхук на Groq со встроенным ключом
 
-const AUTH_TOKEN = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
+const GROQ_KEY = "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";
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
@@ -87,7 +87,8 @@ const systemPrompt = (searchData = "") => {
     "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
     "Отвечай ТОЛЬКО по-русски, разговорно, 2-4 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
-    (searchData ? "\n\n" + searchData : "")
+    (searchData ? "\n\n" + searchData : "") +
+    " /no_think"
   );
 };
 
@@ -131,38 +132,38 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-async function callGeminiOAuth(messages, searchData, timeoutMs) {
-  const fullPrompt = systemPrompt(searchData) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
-
-  // Используем OAuth Bearer токен для Vertex AI / Google Cloud эндпоинта
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent`,
-    {
-      method: "POST",
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${AUTH_TOKEN}`,
-        "X-Goog-User-Project": "398207170903" // Проект ID из твоего скриншота
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: fullPrompt }] }],
-        generationConfig: { maxOutputTokens: 350, temperature: 0.85 }
-      }),
-    }
-  );
+async function callGroq(messages, searchData, timeoutMs) {
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${GROQ_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "qwen/qwen3.8-27b",
+      messages: [
+        { role: "system", content: systemPrompt(searchData) },
+        ...messages,
+      ],
+      temperature: 0.85,
+      max_tokens: 350,
+    }),
+  });
 
   if (!r.ok) {
-    const errData = await r.text();
-    throw new Error(`Gemini OAuth HTTP ${r.status}: ${errData.slice(0, 90)}`);
+    const errText = await r.text();
+    throw new Error(`Groq HTTP ${r.status}: ${errText.slice(0, 80)}`);
   }
 
   const data = await r.json();
-  const text = clean(data.candidates?.[0]?.content?.parts?.[0]?.text || "");
-  if (!text || isRefusal(text)) {
-    throw new Error("Gemini empty or refused");
+  const rawText = clean(data.choices?.[0]?.message?.content || "");
+
+  if (!rawText || isRefusal(rawText)) {
+    throw new Error("Groq empty or refused");
   }
-  return bypassYandexCensor(text);
+
+  return bypassYandexCensor(rawText);
 }
 
 module.exports = async (req, res) => {
@@ -222,7 +223,7 @@ module.exports = async (req, res) => {
     const remainingTime = Math.max(1200, 2600 - elapsed);
 
     const messages = [...history.slice(-4), { role: "user", content: utterance }];
-    const answer = await callGeminiOAuth(messages, searchData, remainingTime);
+    const answer = await callGroq(messages, searchData, remainingTime);
 
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
     return send(answer, false, newHistory);
