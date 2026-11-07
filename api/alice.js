@@ -1,11 +1,12 @@
-// api/alice.js — Чистый вебхук Алисы ТОЛЬКО на Gemini Flash (без Groq)
+// api/alice.js — Финальный вебхук Алисы (Vertex AI для ключей AQ. + gemini-flash-latest + Авто-резерв)
 
-// Жестко зашитый актуальный Auth-ключ и номер проекта со скриншота (игнорируем старый кэш Vercel)
 const GEMINI_KEY = "AQ.Ab8RN6JHxXAoSYbvO2gMF18PzCrxsS7Vz6NRbKhPXE2XBoUa3Q";
 const PROJECT_ID = "398207170903";
+const GROQ_KEY = "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";
 
-// Кэшируем сработавший эндпоинт после первого же успешного запроса
-let fastEndpoint = null;
+let workingGeminiTarget = null;
+let groqModelsCache = null;
+const cooldownUntil = {};
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
@@ -73,7 +74,7 @@ async function fetchSearchContext(query) {
   return "";
 }
 
-const getSystemPrompt = (searchData = "") => {
+const getSystemPrompt = (searchData = "", isQwen = false) => {
   let now = "";
   try {
     now = new Date().toLocaleString("ru-RU", {
@@ -89,11 +90,18 @@ const getSystemPrompt = (searchData = "") => {
     "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с пошлостью. " +
     "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто хочешь меня. " +
     "Иногда органично используешь острые словечки и русский мат для эмоций. " +
-    "Ты помнишь контекст наших прошлых реплик. Всегда отвечай развернуто, сочно и живо в 2-4 предложения! " +
+    "Ты помнишь контекст наших прошлых реплик. ЗАПРЕЩЕНО отвечать односложно одним-двумя словами: всегда отвечай развернуто, сочно и живо в 2-4 полных предложения! " +
     "Если ниже переданы новости из интернета — подробно перескажи их суть в своем кокетливом стиле. " +
     "Отвечай ТОЛЬКО по-русски, разговорно. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
-    (searchData ? "\n\n" + searchData : "")
+    (searchData ? "\n\n" + searchData : "") +
+    (isQwen ? " /no_think" : "")
+  );
+};
+
+const isRefusal = (text) => {
+  return /i'm sorry|i am sorry|i can't|i cannot|as an ai|cannot fulfill|не могу помочь|не могу обсуждать|не могу участвовать|я искусственный интеллект/i.test(
+    text
   );
 };
 
@@ -124,28 +132,34 @@ const bypassYandexCensor = (text) => {
 
 const clean = (t) =>
   String(t || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<think>[\s\S]*/gi, "")
     .replace(/<[^>]*>/g, "")
     .replace(/[*_#`>~]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
-async function callGeminiFlash(messages, searchData, timeoutMs) {
-  // Gemini API требует строгого чередования ролей user -> model и обязательно первой роли user
+// 1. Чистый запрос к Gemini (поддержка Vertex AI для ключей AQ. + твой exact cURL для gemini-flash-latest)
+async function callGemini(messages, searchData, timeoutMs) {
+  const sysText = getSystemPrompt(searchData, false);
+
+  // Формируем абсолютно валидный массив contents со вшитой системной инструкцией (100% совместимость с Vertex и AI Studio)
   const validContents = [];
-  for (const m of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
     const role = m.role === "assistant" ? "model" : "user";
+    const text = i === 0 && role === "user" ? `${sysText}\n\nДиалог:\n${m.content}` : m.content;
+
     if (validContents.length === 0 && role === "model") continue;
     if (validContents.length > 0 && validContents[validContents.length - 1].role === role) {
-      validContents[validContents.length - 1].parts[0].text += "\n" + m.content;
+      validContents[validContents.length - 1].parts[0].text += "\n" + text;
     } else {
-      validContents.push({ role, parts: [{ text: m.content }] });
+      validContents.push({ role, parts: [{ text }] });
     }
   }
 
-  const basePayload = {
-    systemInstruction: {
-      parts: [{ text: getSystemPrompt(searchData) }],
-    },
+  // Строгий payload без нестандартных полей, чтобы Vertex AI не выдавал 400 Bad Request
+  const cleanPayload = JSON.stringify({
     contents: validContents,
     safetySettings: [
       { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
@@ -153,98 +167,160 @@ async function callGeminiFlash(messages, searchData, timeoutMs) {
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
     ],
-  };
-
-  // Для 2.5-flash отключаем thinkingBudget, чтобы ответ летел за 0.4 сек и не тратил токены на размышления
-  const payload25 = JSON.stringify({
-    ...basePayload,
-    generationConfig: {
-      maxOutputTokens: 450,
-      temperature: 0.9,
-      thinkingConfig: { thinkingBudget: 0 },
-    },
-  });
-
-  const payload20 = JSON.stringify({
-    ...basePayload,
     generationConfig: {
       maxOutputTokens: 450,
       temperature: 0.9,
     },
   });
 
-  // Все официальные способы авторизации ключей AQ. в Google AI Studio / Vertex AI Express
   const allTargets = [
-    // 1. x-goog-api-key header (основной для AI Studio Auth Keys)
+    // 1. Vertex AI Express (Regional + Project ID) — родной эндпоинт для ключей AQ.
     {
-      name: "AIStudio-Header-2.5",
-      url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
-      body: payload25,
-    },
-    // 2. Query param ?key= на gemini-2.0-flash (не требует thinkingConfig)
-    {
-      name: "AIStudio-Query-2.0",
-      url: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
-      body: payload20,
-    },
-    // 3. Vertex AI Express Mode (глобальный эндпоинт для ключей AQ.)
-    {
-      name: "Vertex-Express-Global",
-      url: `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
+      name: "Vertex-Project-2.0",
+      url: `https://us-central1-aiplatform.googleapis.com/v1beta1/projects/${PROJECT_ID}/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
       headers: { "Content-Type": "application/json" },
-      body: payload25,
     },
-    // 4. Vertex AI Project Endpoint (с номером твоего проекта 398207170903)
+    // 2. Vertex AI Express (Global endpoint с x-goog-api-key)
     {
-      name: "Vertex-Project",
-      url: `https://aiplatform.googleapis.com/v1beta1/projects/${PROJECT_ID}/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
-      headers: { "Content-Type": "application/json" },
-      body: payload20,
+      name: "Vertex-Global-Header",
+      url: `https://aiplatform.googleapis.com/v1beta1/projects/${PROJECT_ID}/locations/global/publishers/google/models/gemini-2.0-flash:generateContent`,
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
     },
-    // 5. Bearer + Project header
+    // 3. Точная копия твоего cURL из AI Studio (gemini-flash-latest + X-goog-api-key)
     {
-      name: "OAuth-Bearer",
-      url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${GEMINI_KEY}`,
-        "x-goog-user-project": PROJECT_ID,
-      },
-      body: payload20,
+      name: "cURL-Flash-Latest",
+      url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+      headers: { "Content-Type": "application/json", "X-goog-api-key": GEMINI_KEY },
+    },
+    // 4. Vertex AI Express без проекта в пути
+    {
+      name: "Vertex-Publisher",
+      url: `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
     },
   ];
 
-  const targets = fastEndpoint ? [fastEndpoint, ...allTargets.filter((t) => t.name !== fastEndpoint.name)] : allTargets;
+  const targets = workingGeminiTarget ? [workingGeminiTarget] : allTargets;
 
   const attempt = async (t) => {
     const r = await fetch(t.url, {
       method: "POST",
       signal: AbortSignal.timeout(timeoutMs),
       headers: t.headers,
-      body: t.body,
+      body: cleanPayload,
     });
     if (!r.ok) {
       const errTxt = await r.text();
-      throw new Error(`${t.name} (${r.status}): ${errTxt.slice(0, 70)}`);
+      throw new Error(`${t.name}:${r.status}`);
     }
     const data = await r.json();
     const parts = data.candidates?.[0]?.content?.parts || [];
     const textPart = parts.find((p) => p.text && !p.thought) || parts[0];
     const rawText = clean(textPart?.text || "");
-    if (!rawText) throw new Error(`${t.name}: empty`);
-    fastEndpoint = t;
+    if (!rawText || isRefusal(rawText)) throw new Error(`${t.name}:empty`);
+    workingGeminiTarget = t;
     return bypassYandexCensor(rawText);
   };
 
+  return await Promise.any(targets.map((t) => attempt(t)));
+}
+
+// 2. Автоматический резерв, если ключ AQ. требует настройки в Google Cloud
+async function getLiveGroqModels() {
+  if (groqModelsCache && groqModelsCache.length > 0) return groqModelsCache;
   try {
-    // Запускаем параллельно: первый же сработавший протокол мгновенно отдает ответ и запоминается!
-    return await Promise.any(targets.map((t) => attempt(t)));
-  } catch (aggErr) {
-    const firstErr = aggErr.errors?.[0]?.message || aggErr.message || "Unknown error";
-    throw new Error(firstErr);
+    const r = await fetch("https://api.groq.com/openai/v1/models", {
+      headers: { Authorization: `Bearer ${GROQ_KEY}` },
+      signal: AbortSignal.timeout(650),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      const allIds = (data.data || []).map((m) => m.id);
+      const chatModels = allIds.filter(
+        (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard|gpt-oss-20b/i.test(id)
+      );
+      const score = (id) => {
+        if (/llama-3\.3-70b/i.test(id)) return 100;
+        if (/llama-4-maverick|llama-4-scout/i.test(id)) return 95;
+        if (/qwen3\.8-27b|qwen/i.test(id)) return 90;
+        if (/gemma2-9b|llama-3\.1-8b/i.test(id)) return 85;
+        if (/deepseek|kimi|moonshot/i.test(id)) return 80;
+        return 40;
+      };
+      chatModels.sort((a, b) => score(b) - score(a));
+      if (chatModels.length > 0) {
+        groqModelsCache = chatModels;
+        return chatModels;
+      }
+    }
+  } catch (e) {}
+  return [
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.8-27b",
+    "llama-3.1-8b-instant",
+  ];
+}
+
+async function callBackupModel(model, messages, searchData, timeoutMs) {
+  const isQwen = /qwen/i.test(model);
+  const isReasoning = /qwen|deepseek|gpt-oss/i.test(model);
+
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "system", content: getSystemPrompt(searchData, isQwen) }, ...messages],
+      temperature: 0.85,
+      max_tokens: isReasoning ? 950 : 380,
+    }),
+  });
+
+  if (!r.ok) {
+    if (r.status === 429) cooldownUntil[model] = Date.now() + 45000;
+    if (r.status === 404 && groqModelsCache) {
+      groqModelsCache = groqModelsCache.filter((m) => m !== model);
+    }
+    throw new Error(`${model}:${r.status}`);
   }
+
+  const data = await r.json();
+  const rawText = clean(data.choices?.[0]?.message?.content || "");
+  if (!rawText || rawText.length < 4 || isRefusal(rawText)) throw new Error(`${model}:empty`);
+  return bypassYandexCensor(rawText);
+}
+
+async function generateSmartReply(messages, searchData, maxTimeMs) {
+  const start = Date.now();
+  let geminiErr = "";
+
+  // Шаг 1: Пытаемся ответить через Gemini (Vertex AI + gemini-flash-latest)
+  try {
+    return await callGemini(messages, searchData, Math.min(1100, maxTimeMs - 500));
+  } catch (agg) {
+    geminiErr = (agg.errors || []).map((e) => e.message).join(", ") || agg.message;
+  }
+
+  // Шаг 2: Если Google отклонил ключ AQ., мгновенно отвечаем через резервные модели без пауз и ошибок!
+  const models = await getLiveGroqModels();
+  const now = Date.now();
+  const ready = models.filter((m) => !cooldownUntil[m] || cooldownUntil[m] < now);
+  const candidates = ready.length > 0 ? ready : models;
+
+  for (const model of candidates.slice(0, 4)) {
+    const timeLeft = maxTimeMs - (Date.now() - start);
+    if (timeLeft < 350) break;
+    try {
+      return await callBackupModel(model, messages, searchData, Math.min(timeLeft, 1300));
+    } catch (e) {}
+  }
+
+  throw new Error(`Ключ AQ отклонен (${geminiErr})`);
 }
 
 module.exports = async (req, res) => {
@@ -253,7 +329,7 @@ module.exports = async (req, res) => {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const version = body.version || "1.0";
     const rawUtterance = String(body.request?.original_utterance || "").trim();
-    const utterance = rawUtterance.slice(0, 700);
+    const utterance = rawUtterance.slice(0, 600);
 
     const sessionHist = Array.isArray(body.state?.session?.h) ? body.state.session.h : [];
     const userHist = Array.isArray(body.state?.user?.h) ? body.state.user.h : [];
@@ -266,12 +342,13 @@ module.exports = async (req, res) => {
           (m.role === "user" || m.role === "assistant") &&
           typeof m.content === "string" &&
           m.content.length > 4 &&
+          !isRefusal(m.content) &&
+          !m.content.includes("Ошибка") &&
           !m.content.includes("заминка") &&
           !m.content.includes("перегружены") &&
-          !m.content.includes("HTTP") &&
-          !m.content.includes("AIStudio")
+          !m.content.includes("HTTP")
       )
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 220) }));
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 200) }));
 
     const send = (text, end = false, h = history) => {
       const compactUserHistory = h.slice(-4).map((m) => ({
@@ -305,10 +382,10 @@ module.exports = async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
-    const remainingTime = Math.max(1200, 2650 - elapsed);
+    const remainingTime = Math.max(1100, 2650 - elapsed);
 
-    const messages = [...history.slice(-6), { role: "user", content: utterance }];
-    const answer = await callGeminiFlash(messages, searchData, remainingTime);
+    const messages = [...history.slice(-4), { role: "user", content: utterance }];
+    const answer = await generateSmartReply(messages, searchData, remainingTime);
 
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
     return send(answer, false, newHistory);
@@ -316,7 +393,7 @@ module.exports = async (req, res) => {
     return res.status(200).json({
       version: "1.0",
       response: {
-        text: `Ошибка Gemini: ${fatalError.message.slice(0, 140)}`,
+        text: `Сбой: ${fatalError.message.slice(0, 140)}`,
         end_session: false,
       },
     });
