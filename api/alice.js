@@ -1,7 +1,9 @@
-// api/alice.js — идеальный вебхук Алисы на официальном Gemini API
+// api/alice.js — финальный рабочий вебхук под Gemini с правильной авторизацией по ключу
+
+const GEMINI_KEY = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
 
 const SEARCH_RE =
-  /новост|сегодня|vчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
+  /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
 
 async function fetchSearchContext(query) {
   const cleanQuery = query
@@ -128,23 +130,20 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-async function callGeminiSDK(messages, searchData, timeoutMs) {
-  const token = process.env.GEMINI_API_KEY || "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
-  
-  // Форматируем историю для Gemini API (contents)
+async function callGemini(messages, searchData, timeoutMs) {
   const contents = messages.map(m => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: [{ text: m.content }]
   }));
 
+  // Передаем ключ в URL через ?key=, как требует Google для таких ключей
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
     {
       method: "POST",
       signal: AbortSignal.timeout(timeoutMs),
       headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         system_instruction: {
@@ -152,7 +151,7 @@ async function callGeminiSDK(messages, searchData, timeoutMs) {
         },
         contents: contents,
         generationConfig: { 
-          maxOutputTokens: 600, // Большой лимит, чтобы никогда не отвечала односложно
+          maxOutputTokens: 600, 
           temperature: 0.9 
         }
       }),
@@ -231,7 +230,7 @@ module.exports = async (req, res) => {
     const remainingTime = Math.max(1200, 2700 - elapsed);
 
     const messages = [...history.slice(-6), { role: "user", content: utterance }];
-    const answer = await callGeminiSDK(messages, searchData, remainingTime);
+    const answer = await callGemini(messages, searchData, remainingTime);
 
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-8);
     return send(answer, false, newHistory);
