@@ -1,11 +1,19 @@
-// api/alice.js — Полный безотказный вебхук Алисы (Gemini + Groq Auto-Fallback)
+// api/alice.js — Железобетонный вебхук Алисы (Новый ключ AQ. со скриншота + Полный пул моделей без 429)
 
-const GEMINI_KEY = (process.env.GEMINI_API_KEY || "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ").trim();
+// Твой реальный ключ прямо со скриншота AI Studio + запасной из переменных окружения
+const GEMINI_KEYS = [
+  process.env.GEMINI_API_KEY,
+  "AQ.Ab8RN6JHxXAoSYbvO2gMF18PzCrxsS7Vz6NRbKhPXE2XBoUa3Q",
+  "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ",
+].filter(Boolean);
+
+const PROJECT_ID = "398207170903";
 const GROQ_KEY = (process.env.GROQ_API_KEY || "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").trim();
 
 let groqModelsCache = null;
 const cooldownUntil = {};
-let geminiWorks = true;
+let workingGeminiConfig = null;
+let geminiDisabledUntil = 0;
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
@@ -24,7 +32,7 @@ async function fetchSearchContext(query) {
           "X-API-KEY": process.env.SERPER_API_KEY,
           "Content-Type": "application/json",
         },
-        signal: AbortSignal.timeout(750),
+        signal: AbortSignal.timeout(700),
         body: JSON.stringify({ q: searchTopic, gl: "ru", hl: "ru", num: 3 }),
       });
       if (r.ok) {
@@ -32,7 +40,7 @@ async function fetchSearchContext(query) {
         const snippets = (data.organic || [])
           .map((item) => `- ${item.title}: ${item.snippet}`)
           .join("\n");
-        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 800);
+        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 750);
       }
     } catch (e) {}
   }
@@ -41,7 +49,7 @@ async function fetchSearchContext(query) {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
     )}&hl=ru&gl=RU&ceid=RU:ru`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(750) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(700) });
     const xml = await r.text();
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 3);
     const parsed = items
@@ -52,12 +60,12 @@ async function fetchSearchContext(query) {
       .filter(Boolean);
 
     if (parsed.length > 0) {
-      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 800);
+      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 750);
     }
   } catch (e) {}
 
   try {
-    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(600) });
+    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(550) });
     const xml = await r.text();
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
     const parsed = items
@@ -67,7 +75,7 @@ async function fetchSearchContext(query) {
         return title ? `- ${title.trim()}` : "";
       })
       .filter(Boolean);
-    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 800);
+    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 750);
   } catch (e) {}
 
   return "";
@@ -138,9 +146,9 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-// 1. Попытка через Gemini 2.5 Flash (с отключенной цензурой BLOCK_NONE)
+// 1. Умный пробив Gemini API (поддерживает и AIza, и новые AQ. ключи через Vertex/Google AI)
 async function tryGemini(messages, searchData, timeoutMs) {
-  if (!geminiWorks || !GEMINI_KEY) throw new Error("Gemini skipped");
+  if (Date.now() < geminiDisabledUntil) throw new Error("Gemini on cooldown");
 
   const contents = messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
@@ -164,43 +172,58 @@ async function tryGemini(messages, searchData, timeoutMs) {
     },
   });
 
-  // Пробуем стандартный заголовок x-goog-api-key для модели gemini-2.5-flash
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
-    {
+  const key = GEMINI_KEYS[0];
+  const attempts = workingGeminiConfig
+    ? [workingGeminiConfig]
+    : [
+        // Вариант 1: Vertex AI Express endpoint для ключей AQ. и проекта 398207170903
+        {
+          url: `https://aiplatform.googleapis.com/v1beta1/projects/${PROJECT_ID}/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent?key=${key}`,
+          headers: { "Content-Type": "application/json" },
+        },
+        // Вариант 2: Стандартный эндпоинт с x-goog-api-key
+        {
+          url: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key,
+          },
+        },
+      ];
+
+  const reqs = attempts.map(async (cfg) => {
+    const r = await fetch(cfg.url, {
       method: "POST",
       signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_KEY,
-      },
+      headers: cfg.headers,
       body: bodyPayload,
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const rawText = clean(data.candidates?.[0]?.content?.parts?.[0]?.text || "");
+    if (!rawText || rawText.length < 4 || isRefusal(rawText)) {
+      throw new Error("Empty or refused");
     }
-  );
+    workingGeminiConfig = cfg;
+    return bypassYandexCensor(rawText);
+  });
 
-  if (!r.ok) {
-    if (r.status === 401 || r.status === 403) {
-      // Если ключ AQ. не принимается напрямую без Google Cloud SDK, отключаем лишние попытки в текущем инстансе
-      geminiWorks = false;
-    }
-    throw new Error(`Gemini ${r.status}`);
+  try {
+    return await Promise.any(reqs);
+  } catch (e) {
+    // Если ключ AQ. не подошел, отключаем попытки Gemini на 5 минут, чтобы не тратить ни миллисекунды!
+    geminiDisabledUntil = Date.now() + 300000;
+    throw e;
   }
-
-  const data = await r.json();
-  const rawText = clean(data.candidates?.[0]?.content?.parts?.[0]?.text || "");
-  if (!rawText || rawText.length < 5 || isRefusal(rawText)) {
-    throw new Error("Gemini empty or refused");
-  }
-  return bypassYandexCensor(rawText);
 }
 
-// 2. Получение реально живых моделей твоего аккаунта Groq
+// 2. Получение полного списка живых моделей Groq (с увеличенным таймаутом и мощным резервом)
 async function getGroqModels() {
   if (groqModelsCache && groqModelsCache.length > 0) return groqModelsCache;
   try {
     const r = await fetch("https://api.groq.com/openai/v1/models", {
       headers: { Authorization: `Bearer ${GROQ_KEY}` },
-      signal: AbortSignal.timeout(550),
+      signal: AbortSignal.timeout(900),
     });
     if (r.ok) {
       const data = await r.json();
@@ -209,16 +232,21 @@ async function getGroqModels() {
         (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
       );
 
-      // Приоритет моделям, которые НЕ тратят токены на скрытые размышления и отвечают длинно
+      // Ставим в начало быстрые безлимитные модели, а gpt-oss убираем в самый конец!
       const score = (id) => {
         if (/llama-3\.3-70b/i.test(id)) return 100;
-        if (/qwen3\.8-27b/i.test(id)) return 95;
-        if (/llama-4-maverick|llama-4-scout/i.test(id)) return 90;
-        if (/gemma2-9b|llama-3\.1-8b/i.test(id)) return 85;
-        if (/qwen/i.test(id)) return 80;
-        if (/gpt-oss-120b/i.test(id)) return 60;
-        if (/gpt-oss/i.test(id)) return 50;
-        return 10;
+        if (/llama-4-maverick/i.test(id)) return 96;
+        if (/llama-4-scout/i.test(id)) return 94;
+        if (/qwen3\.8-27b/i.test(id)) return 90;
+        if (/qwen/i.test(id)) return 88;
+        if (/deepseek/i.test(id)) return 85;
+        if (/gemma2-9b/i.test(id)) return 82;
+        if (/llama-3\.1-8b/i.test(id)) return 80;
+        if (/kimi|moonshot/i.test(id)) return 75;
+        if (/compound/i.test(id)) return 65;
+        if (/gpt-oss-120b/i.test(id)) return 30;
+        if (/gpt-oss-20b/i.test(id)) return 10;
+        return 50;
       };
 
       chatModels.sort((a, b) => score(b) - score(a));
@@ -228,11 +256,22 @@ async function getGroqModels() {
       }
     }
   } catch (e) {}
-  return ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+
+  // Широкий резервный список из 7 разных моделей (каждая со своим отдельным лимитом на Groq!)
+  return [
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.8-27b",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "openai/gpt-oss-120b",
+  ];
 }
 
 async function callSingleGroq(model, messages, searchData, timeoutMs) {
   const isQwen = /qwen/i.test(model);
+  const isReasoning = /qwen|deepseek|gpt-oss/i.test(model);
 
   const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -248,24 +287,26 @@ async function callSingleGroq(model, messages, searchData, timeoutMs) {
         ...messages,
       ],
       temperature: 0.85,
-      // 1024 токена! Чтобы думающие модели (Qwen3.8 / GPT-OSS) никогда не обрезали ответ до 1-2 слов!
-      max_tokens: 1024,
+      // Для обычных моделей 350 токенов (чтобы не тратить TPM лимит!), для думающих — 900
+      max_tokens: isReasoning ? 900 : 350,
     }),
   });
 
   if (!r.ok) {
-    if (r.status === 429) cooldownUntil[model] = Date.now() + 35000;
+    if (r.status === 429) {
+      cooldownUntil[model] = Date.now() + 50000; // Замораживаем перегруженную модель на 50 сек
+    }
     if (r.status === 404 && groqModelsCache) {
       groqModelsCache = groqModelsCache.filter((m) => m !== model);
     }
     const errText = await r.text();
-    throw new Error(`[${model}] ${r.status}: ${errText.slice(0, 60)}`);
+    throw new Error(`[${model}] ${r.status}: ${errText.slice(0, 50)}`);
   }
 
   const data = await r.json();
   const rawText = clean(data.choices?.[0]?.message?.content || "");
 
-  if (!rawText || isRefusal(rawText)) {
+  if (!rawText || rawText.length < 4 || isRefusal(rawText)) {
     throw new Error(`[${model}] refusal/empty`);
   }
 
@@ -275,32 +316,33 @@ async function callSingleGroq(model, messages, searchData, timeoutMs) {
 async function generateSmartReply(messages, searchData, maxTimeMs) {
   const start = Date.now();
 
-  // Шаг 1: Пробуем Gemini (если ключ рабочий)
-  if (geminiWorks) {
+  // 1. Пробуем Gemini (с новым ключом со скриншота)
+  if (Date.now() >= geminiDisabledUntil) {
     try {
-      return await tryGemini(messages, searchData, Math.min(900, maxTimeMs - 400));
+      return await tryGemini(messages, searchData, Math.min(800, maxTimeMs - 500));
     } catch (e) {}
   }
 
-  // Шаг 2: Безотказный роутер по всем живым моделям Groq
+  // 2. Перебираем все живые модели Groq, обходя любые 429 лимиты
   const models = await getGroqModels();
   const now = Date.now();
   const ready = models.filter((m) => !cooldownUntil[m] || cooldownUntil[m] < now);
   const candidates = ready.length > 0 ? ready : models;
 
-  let lastErr = "";
-  for (const model of candidates.slice(0, 4)) {
+  // Запускаем по 2 модели параллельно батчами, чтобы гарантированно успеть за 2 секунды даже если 2-3 модели в лимите 429!
+  for (let i = 0; i < candidates.length; i += 2) {
     const timeLeft = maxTimeMs - (Date.now() - start);
     if (timeLeft < 350) break;
 
+    const batch = candidates.slice(i, i + 2);
     try {
-      return await callSingleGroq(model, messages, searchData, Math.min(timeLeft, 1900));
-    } catch (e) {
-      lastErr = e.message;
-    }
+      return await Promise.any(
+        batch.map((m) => callSingleGroq(m, messages, searchData, Math.min(timeLeft, 1500)))
+      );
+    } catch (e) {}
   }
 
-  throw new Error(lastErr || "Нет ответа от моделей");
+  throw new Error("Все модели перегружены, подожди 10 секунд");
 }
 
 module.exports = async (req, res) => {
@@ -309,13 +351,12 @@ module.exports = async (req, res) => {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const version = body.version || "1.0";
     const rawUtterance = String(body.request?.original_utterance || "").trim();
-    const utterance = rawUtterance.slice(0, 650);
+    const utterance = rawUtterance.slice(0, 500);
 
     const sessionHist = Array.isArray(body.state?.session?.h) ? body.state.session.h : [];
     const userHist = Array.isArray(body.state?.user?.h) ? body.state.user.h : [];
     const rawHistory = sessionHist.length > 0 ? sessionHist : userHist;
 
-    // Вычищаем из памяти любые старые ошибки и короткие обрывки, чтобы модель не повторяла их стиль!
     const history = rawHistory
       .filter(
         (m) =>
@@ -326,9 +367,10 @@ module.exports = async (req, res) => {
           !isRefusal(m.content) &&
           !m.content.includes("заминка") &&
           !m.content.includes("лимит") &&
+          !m.content.includes("перегружены") &&
           !m.content.includes("HTTP")
       )
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 220) }));
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 180) }));
 
     const send = (text, end = false, h = history) => {
       const compactUserHistory = h.slice(-4).map((m) => ({
