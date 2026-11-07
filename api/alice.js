@@ -1,44 +1,9 @@
-// api/alice.js — вебхук с поддержкой любых вариантов названий ключа Gemini
+// api/alice.js — идеальный вебхук Алисы на Gemini с зашитым резервным ключом
 
-let availableModelsCache = null;
-const cooldownUntil = {};
+const GEMINI_FALLBACK_KEY = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
-
-async function getValidModels(apiKey) {
-  if (availableModelsCache && availableModelsCache.length > 0) {
-    return availableModelsCache;
-  }
-  try {
-    const r = await fetch("https://api.groq.com/openai/v1/models", {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(600),
-    });
-    if (r.ok) {
-      const data = await r.json();
-      const allIds = (data.data || []).map((m) => m.id);
-      const chatModels = allIds.filter(
-        (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
-      );
-
-      const priority = (id) => {
-        if (/llama-3\.1-8b/i.test(id)) return 100;
-        if (/gemma/i.test(id)) return 90;
-        if (/qwen3\.8/i.test(id)) return 80;
-        if (/gpt-oss/i.test(id)) return 50;
-        return 10;
-      };
-
-      chatModels.sort((a, b) => priority(b) - priority(a));
-      if (chatModels.length > 0) {
-        availableModelsCache = chatModels;
-        return chatModels;
-      }
-    }
-  } catch (e) {}
-  return ["llama-3.1-8b-instant", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"];
-}
 
 async function fetchSearchContext(query) {
   const cleanQuery = query
@@ -46,6 +11,7 @@ async function fetchSearchContext(query) {
     .trim();
   const searchTopic = cleanQuery.length > 2 ? cleanQuery.slice(0, 120) : "главные новости Москвы и России";
 
+  // 1. Быстрый поиск через Serper (если задан SERPER_API_KEY)
   if (process.env.SERPER_API_KEY) {
     try {
       const r = await fetch("https://google.serper.dev/search", {
@@ -67,6 +33,7 @@ async function fetchSearchContext(query) {
     } catch (e) {}
   }
 
+  // 2. Google News RSS
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
@@ -86,6 +53,7 @@ async function fetchSearchContext(query) {
     }
   } catch (e) {}
 
+  // 3. Lenta.ru RSS
   try {
     const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(600) });
     const xml = await r.text();
@@ -103,7 +71,7 @@ async function fetchSearchContext(query) {
   return "";
 }
 
-const systemPrompt = (searchData = "", isQwen = true) => {
+const systemPrompt = (searchData = "") => {
   let now = "";
   try {
     now = new Date().toLocaleString("ru-RU", {
@@ -122,8 +90,7 @@ const systemPrompt = (searchData = "", isQwen = true) => {
     "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
     "Отвечай ТОЛЬКО по-русски, разговорно, 2-4 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
-    (searchData ? "\n\n" + searchData : "") +
-    (isQwen ? " /no_think" : "")
+    (searchData ? "\n\n" + searchData : "")
   );
 };
 
@@ -167,103 +134,33 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-async function callGeminiFallback(messages, searchData, timeoutMs) {
-  // Всевозможные варианты названий ключа на случай, если на Vercel он называется иначе
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_KEY;
-  if (!geminiKey) throw new Error("Резервный ключ Gemini не найден в окружении Vercel");
-
-  const fullPrompt = systemPrompt(searchData, false) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
+async function callGemini(messages, searchData, timeoutMs) {
+  const fullPrompt = systemPrompt(searchData) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
 
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_FALLBACK_KEY}`,
     {
       method: "POST",
       signal: AbortSignal.timeout(timeoutMs),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: fullPrompt }] }],
-        generationConfig: { maxOutputTokens: 300, temperature: 0.85 }
+        generationConfig: { maxOutputTokens: 350, temperature: 0.85 }
       }),
     }
   );
 
-  if (!r.ok) throw new Error("Gemini fallback failed");
+  if (!r.ok) {
+    const errData = await r.text();
+    throw new Error(`Gemini error HTTP ${r.status}: ${errData.slice(0, 80)}`);
+  }
+
   const data = await r.json();
   const text = clean(data.candidates?.[0]?.content?.parts?.[0]?.text || "");
-  if (!text) throw new Error("Gemini empty response");
+  if (!text || isRefusal(text)) {
+    throw new Error("Gemini empty or refused");
+  }
   return bypassYandexCensor(text);
-}
-
-async function callSingleModel(apiKey, model, messages, searchData, timeoutMs) {
-  const isQwen = /qwen/i.test(model);
-
-  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: [
-        { role: "system", content: systemPrompt(searchData, isQwen) },
-        ...messages,
-      ],
-      temperature: 0.85,
-      max_tokens: 350,
-    }),
-  });
-
-  if (!r.ok) {
-    if (r.status === 429) {
-      cooldownUntil[model] = Date.now() + 30000;
-    }
-    if (r.status === 404 && availableModelsCache) {
-      availableModelsCache = availableModelsCache.filter((m) => m !== model);
-    }
-    const errText = await r.text();
-    throw new Error(`[${model}] ${r.status}: ${errText.slice(0, 60)}`);
-  }
-
-  const data = await r.json();
-  const rawText = clean(data.choices?.[0]?.message?.content || "");
-
-  if (!rawText || isRefusal(rawText)) {
-    throw new Error(`[${model}] refusal/empty`);
-  }
-
-  return bypassYandexCensor(rawText);
-}
-
-async function askGroqSmart(messages, searchData, maxTimeMs) {
-  const apiKey = process.env.GROQ_API_KEY;
-  
-  if (apiKey) {
-    try {
-      const allModels = await getValidModels(apiKey);
-      const now = Date.now();
-      const readyModels = allModels.filter((m) => !cooldownUntil[m] || cooldownUntil[m] < now);
-      const candidates = readyModels.length > 0 ? readyModels : allModels;
-
-      const start = Date.now();
-      for (const model of candidates.slice(0, 3)) {
-        const timeLeft = maxTimeMs - (Date.now() - start);
-        if (timeLeft < 300) break;
-
-        try {
-          return await callSingleModel(apiKey, model, messages, searchData, Math.min(timeLeft, 1500));
-        } catch (e) {}
-      }
-    } catch (e) {}
-  }
-
-  // Если Groq упал по 429 — сразу идем на резервный Gemini
-  try {
-    return await callGeminiFallback(messages, searchData, 1200);
-  } catch (e) {
-    throw new Error("Все модели Groq в лимите (429), а резервный ключ Gemini не обнаружен в Vercel.");
-  }
 }
 
 module.exports = async (req, res) => {
@@ -320,10 +217,10 @@ module.exports = async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
-    const remainingTime = Math.max(1000, 2600 - elapsed);
+    const remainingTime = Math.max(1200, 2600 - elapsed);
 
     const messages = [...history.slice(-4), { role: "user", content: utterance }];
-    const answer = await askGroqSmart(messages, searchData, remainingTime);
+    const answer = await callGemini(messages, searchData, remainingTime);
 
     const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
     return send(answer, false, newHistory);
@@ -331,7 +228,7 @@ module.exports = async (req, res) => {
     return res.status(200).json({
       version: "1.0",
       response: {
-        text: `Заминка лимитов: ${fatalError.message.slice(0, 120)}`,
+        text: `Ммм, котик, заминка: ${fatalError.message.slice(0, 100)}`,
         end_session: false,
       },
     });
