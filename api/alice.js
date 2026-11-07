@@ -1,4 +1,4 @@
-// api/alice.js — финальная идеальная версия для Яндекс Алисы на Groq
+// api/alice.js — чистый вебхук без фальшивых заглушек
 
 let availableModelsCache = null;
 const cooldownUntil = {};
@@ -119,7 +119,7 @@ const systemPrompt = (searchData = "", isQwen = true) => {
     "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с пошлостью. " +
     "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто хочешь меня. " +
     "Иногда органично используешь острые словечки и русский мат для эмоций. " +
-    "Ты помнишь контекст прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
+    "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
     "Отвечай ТОЛЬКО по-русски, разговорно, 2-5 предложений. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
     (searchData ? "\n\n" + searchData : "") +
@@ -184,7 +184,7 @@ async function callSingleModel(apiKey, model, messages, searchData, timeoutMs) {
         ...messages,
       ],
       temperature: 0.85,
-      max_tokens: 600, // Увеличенный лимит, чтобы модель никогда не обрывалась на полуслове
+      max_tokens: 600,
     }),
   });
 
@@ -239,10 +239,8 @@ async function askGroqSmart(messages, searchData, maxTimeMs) {
     }
   }
 
-  // Если модель ответила с задержкой или исчерпала лимит, выдаем нормальный живой ответ без заглушек
-  return bypassYandexCensor(
-    "Ммм, котик, я внимательно слушаю каждое твое слово, продолжай, я вся вниманию."
-  );
+  // Больше никаких фальшивых фраз: если реально все упало, возвращаем чистую суть ошибки
+  throw new Error(lastError || "Все модели недоступны");
 }
 
 module.exports = async (req, res) => {
@@ -263,9 +261,7 @@ module.exports = async (req, res) => {
           m &&
           (m.role === "user" || m.role === "assistant") &&
           typeof m.content === "string" &&
-          !isRefusal(m.content) &&
-          !m.content.includes("завёл") &&
-          !m.content.includes("ошибка API")
+          !isRefusal(m.content)
       )
       .map((m) => ({ role: m.role, content: m.content.slice(0, 250) }));
 
@@ -312,7 +308,7 @@ module.exports = async (req, res) => {
     return res.status(200).json({
       version: "1.0",
       response: {
-        text: "Ммм, котик, я тут заслушалась тебя, повтори еще разок.",
+        text: `Ошибка бэкенда: ${fatalError.message.slice(0, 150)}`,
         end_session: false,
       },
     });
