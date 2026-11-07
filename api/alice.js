@@ -1,9 +1,7 @@
-// api/alice.js — финальный рабочий вебхук на Groq со встроенным ключом
-
-const GROQ_KEY = "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";
+// api/alice.js — идеальный вебхук Алисы на официальном Gemini API
 
 const SEARCH_RE =
-  /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
+  /новост|сегодня|vчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
 
 async function fetchSearchContext(query) {
   const cleanQuery = query
@@ -19,7 +17,7 @@ async function fetchSearchContext(query) {
           "X-API-KEY": process.env.SERPER_API_KEY,
           "Content-Type": "application/json",
         },
-        signal: AbortSignal.timeout(800),
+        signal: AbortSignal.timeout(900),
         body: JSON.stringify({ q: searchTopic, gl: "ru", hl: "ru", num: 3 }),
       });
       if (r.ok) {
@@ -27,7 +25,7 @@ async function fetchSearchContext(query) {
         const snippets = (data.organic || [])
           .map((item) => `- ${item.title}: ${item.snippet}`)
           .join("\n");
-        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 800);
+        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 900);
       }
     } catch (e) {}
   }
@@ -36,7 +34,7 @@ async function fetchSearchContext(query) {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
     )}&hl=ru&gl=RU&ceid=RU:ru`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(800) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(900) });
     const xml = await r.text();
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 3);
     const parsed = items
@@ -47,12 +45,12 @@ async function fetchSearchContext(query) {
       .filter(Boolean);
 
     if (parsed.length > 0) {
-      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 800);
+      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 900);
     }
   } catch (e) {}
 
   try {
-    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(600) });
+    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(700) });
     const xml = await r.text();
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
     const parsed = items
@@ -62,13 +60,13 @@ async function fetchSearchContext(query) {
         return title ? `- ${title.trim()}` : "";
       })
       .filter(Boolean);
-    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 800);
+    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 900);
   } catch (e) {}
 
   return "";
 }
 
-const systemPrompt = (searchData = "") => {
+const getSystemInstruction = (searchData = "") => {
   let now = "";
   try {
     now = new Date().toLocaleString("ru-RU", {
@@ -84,11 +82,11 @@ const systemPrompt = (searchData = "") => {
     "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с пошлостью. " +
     "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто хочешь меня. " +
     "Иногда органично используешь острые словечки и русский мат для эмоций. " +
-    "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
-    "Отвечай ТОЛЬКО по-русски, разговорно, 2-4 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
+    "Ты помнишь контекст наших прошлых реплик. Никогда не отвечай односложно (всегда пиши развернуто, 2-4 предложения). " +
+    "Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
+    "Отвечай ТОЛЬКО по-русски, разговорно. Никакого markdown, списков, скобок и эмодзи: ответ должен отлично звучать вслух. " +
     "Сейчас " + now + " по Москве." +
-    (searchData ? "\n\n" + searchData : "") +
-    " /no_think"
+    (searchData ? "\n\n" + searchData : "")
   );
 };
 
@@ -125,42 +123,52 @@ const bypassYandexCensor = (text) => {
 
 const clean = (t) =>
   String(t || "")
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<think>[\s\S]*/gi, "")
     .replace(/<[^>]*>/g, "")
     .replace(/[*_#`>~]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
-async function callGroq(messages, searchData, timeoutMs) {
-  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${GROQ_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "qwen/qwen3.8-27b",
-      messages: [
-        { role: "system", content: systemPrompt(searchData) },
-        ...messages,
-      ],
-      temperature: 0.85,
-      max_tokens: 350,
-    }),
-  });
+async function callGeminiSDK(messages, searchData, timeoutMs) {
+  const token = process.env.GEMINI_API_KEY || "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
+  
+  // Форматируем историю для Gemini API (contents)
+  const contents = messages.map(m => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }]
+  }));
+
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
+    {
+      method: "POST",
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        system_instruction: {
+          parts: [{ text: getSystemInstruction(searchData) }]
+        },
+        contents: contents,
+        generationConfig: { 
+          maxOutputTokens: 600, // Большой лимит, чтобы никогда не отвечала односложно
+          temperature: 0.9 
+        }
+      }),
+    }
+  );
 
   if (!r.ok) {
     const errText = await r.text();
-    throw new Error(`Groq HTTP ${r.status}: ${errText.slice(0, 80)}`);
+    throw new Error(`Gemini HTTP ${r.status}: ${errText.slice(0, 100)}`);
   }
 
   const data = await r.json();
-  const rawText = clean(data.choices?.[0]?.message?.content || "");
+  const rawText = clean(data.candidates?.[0]?.content?.parts?.[0]?.text || "");
 
   if (!rawText || isRefusal(rawText)) {
-    throw new Error("Groq empty or refused");
+    throw new Error("Gemini empty or refused");
   }
 
   return bypassYandexCensor(rawText);
@@ -172,7 +180,7 @@ module.exports = async (req, res) => {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const version = body.version || "1.0";
     const rawUtterance = String(body.request?.original_utterance || "").trim();
-    const utterance = rawUtterance.slice(0, 600);
+    const utterance = rawUtterance.slice(0, 800);
 
     const sessionHist = Array.isArray(body.state?.session?.h) ? body.state.session.h : [];
     const userHist = Array.isArray(body.state?.user?.h) ? body.state.user.h : [];
@@ -186,17 +194,17 @@ module.exports = async (req, res) => {
           typeof m.content === "string" &&
           !isRefusal(m.content)
       )
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 200) }));
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 300) }));
 
     const send = (text, end = false, h = history) => {
       const compactUserHistory = h.slice(-4).map((m) => ({
         role: m.role,
-        content: String(m.content).slice(0, 130),
+        content: String(m.content).slice(0, 140),
       }));
 
       return res.status(200).json({
         version,
-        session_state: { h: h.slice(-6) },
+        session_state: { h: h.slice(-8) },
         user_state_update: { h: compactUserHistory },
         response: {
           text: String(text).slice(0, 950),
@@ -220,18 +228,18 @@ module.exports = async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
-    const remainingTime = Math.max(1200, 2600 - elapsed);
+    const remainingTime = Math.max(1200, 2700 - elapsed);
 
-    const messages = [...history.slice(-4), { role: "user", content: utterance }];
-    const answer = await callGroq(messages, searchData, remainingTime);
+    const messages = [...history.slice(-6), { role: "user", content: utterance }];
+    const answer = await callGeminiSDK(messages, searchData, remainingTime);
 
-    const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
+    const newHistory = [...messages, { role: "assistant", content: answer }].slice(-8);
     return send(answer, false, newHistory);
   } catch (fatalError) {
     return res.status(200).json({
       version: "1.0",
       response: {
-        text: `Ммм, котик, заминка: ${fatalError.message.slice(0, 100)}`,
+        text: `Ммм, котик, небольшая заминка: ${fatalError.message.slice(0, 100)}`,
         end_session: false,
       },
     });
