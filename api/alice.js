@@ -1,6 +1,6 @@
-// api/alice.js — идеальный вебхук Алисы на Gemini с зашитым резервным ключом
+// api/alice.js — вебхук Алисы на официальном Gemini API с поддержкой ключей AQ.
 
-const GEMINI_FALLBACK_KEY = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
+const GEMINI_KEY = "AQ.Ab8RN6LADzT5ZDu9uf_mt-SO7myu1vz57who6sdIzwe1VLZ5hQ";
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
@@ -11,7 +11,6 @@ async function fetchSearchContext(query) {
     .trim();
   const searchTopic = cleanQuery.length > 2 ? cleanQuery.slice(0, 120) : "главные новости Москвы и России";
 
-  // 1. Быстрый поиск через Serper (если задан SERPER_API_KEY)
   if (process.env.SERPER_API_KEY) {
     try {
       const r = await fetch("https://google.serper.dev/search", {
@@ -33,7 +32,6 @@ async function fetchSearchContext(query) {
     } catch (e) {}
   }
 
-  // 2. Google News RSS
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
@@ -53,7 +51,6 @@ async function fetchSearchContext(query) {
     }
   } catch (e) {}
 
-  // 3. Lenta.ru RSS
   try {
     const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(600) });
     const xml = await r.text();
@@ -137,12 +134,16 @@ const clean = (t) =>
 async function callGemini(messages, searchData, timeoutMs) {
   const fullPrompt = systemPrompt(searchData) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
 
+  // Пробуем передать ключ и как query-параметр, и как Bearer токен в заголовках
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_FALLBACK_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
     {
       method: "POST",
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { "Content-Type": "application/json" },
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GEMINI_KEY}`
+      },
       body: JSON.stringify({
         contents: [{ parts: [{ text: fullPrompt }] }],
         generationConfig: { maxOutputTokens: 350, temperature: 0.85 }
@@ -152,7 +153,7 @@ async function callGemini(messages, searchData, timeoutMs) {
 
   if (!r.ok) {
     const errData = await r.text();
-    throw new Error(`Gemini error HTTP ${r.status}: ${errData.slice(0, 80)}`);
+    throw new Error(`Gemini HTTP ${r.status}: ${errData.slice(0, 90)}`);
   }
 
   const data = await r.json();
