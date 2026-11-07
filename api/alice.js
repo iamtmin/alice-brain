@@ -1,26 +1,61 @@
-// api/alice.js — стабильный вебхук Яндекс Алисы на Groq (без ошибок 400/404)
+// api/alice.js — безотказный вебхук Яндекс Алисы (авто-обход 429 Rate Limit и 404)
 
-// Только реально работающие сейчас модели на Groq
-const MODELS = [
-  "qwen/qwen3-32b",
-  "qwen/qwen3.8-27b",
-  "meta-llama/llama-4-scout-17b-16e-instruct",
-  "meta-llama/llama-4-maverick-17b-128e-instruct",
-  "openai/gpt-oss-120b",
-];
-
-let bestModel = null;
+// Кэшируем список реально существующих на твоем ключе моделей (живет пока теплый инстанс Vercel)
+let availableModelsCache = null;
+const cooldownUntil = {}; // Временный бан модели, если она словила 429 Rate Limit
 
 const SEARCH_RE =
   /новост|сегодня|вчера|завтра|послед|свеж|актуальн|курс|погод|сколько стоит|кто выиграл|счёт|счет|матч|результат|случилось|произошло|найди|поищи|в интернете|расписание|когда выйдет|вышел ли|2025|2026|что там с|расскажи про|школ|полици|москв/i;
+
+// Получаем ТОЛЬКО реально доступные на твоем аккаунте модели (0 шансов получить 404)
+async function getValidModels(apiKey) {
+  if (availableModelsCache && availableModelsCache.length > 0) {
+    return availableModelsCache;
+  }
+  try {
+    const r = await fetch("https://api.groq.com/openai/v1/models", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(600),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      const allIds = (data.data || []).map((m) => m.id);
+
+      // Отсекаем все не-чат модели (озвучку, whisper, guard и т.д.)
+      const chatModels = allIds.filter(
+        (id) =>
+          !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
+      );
+
+      // Приоритет: сначала Qwen 3.8, затем другие Qwen/DeepSeek/Llama, затем мощный GPT-OSS-120B как железный резерв
+      const priority = (id) => {
+        if (id === "qwen/qwen3.8-27b") return 100;
+        if (/qwen|deepseek|mistral|mixtral/i.test(id)) return 80;
+        if (/gemma|llama/i.test(id)) return 60;
+        if (/gpt-oss-120b/i.test(id)) return 50;
+        if (/gpt-oss|compound/i.test(id)) return 40;
+        return 10;
+      };
+
+      chatModels.sort((a, b) => priority(b) - priority(a));
+      if (chatModels.length > 0) {
+        availableModelsCache = chatModels;
+        return chatModels;
+      }
+    }
+  } catch (e) {}
+
+  // Железный резерв, если список моделей не успел загрузиться
+  return ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"];
+}
 
 async function fetchSearchContext(query) {
   const cleanQuery = query
     .replace(/расскажи|какие|новости|сегодня|свежие|последние|найди|поищи|алиса|про|проверь/gi, "")
     .trim();
-  const searchTopic = cleanQuery.length > 2 ? cleanQuery : "главные новости Москвы и России";
+  const searchTopic = cleanQuery.length > 2 ? cleanQuery.slice(0, 120) : "главные новости Москвы и России";
 
-  // 1. Быстрый поиск через Serper (Google Search API за ~300 мс), если есть SERPER_API_KEY
+  // 1. Быстрый поиск через Serper (если задан SERPER_API_KEY)
   if (process.env.SERPER_API_KEY) {
     try {
       const r = await fetch("https://google.serper.dev/search", {
@@ -29,58 +64,58 @@ async function fetchSearchContext(query) {
           "X-API-KEY": process.env.SERPER_API_KEY,
           "Content-Type": "application/json",
         },
-        signal: AbortSignal.timeout(900),
-        body: JSON.stringify({ q: searchTopic, gl: "ru", hl: "ru", num: 4 }),
+        signal: AbortSignal.timeout(800),
+        body: JSON.stringify({ q: searchTopic, gl: "ru", hl: "ru", num: 3 }),
       });
       if (r.ok) {
         const data = await r.json();
         const snippets = (data.organic || [])
           .map((item) => `- ${item.title}: ${item.snippet}`)
           .join("\n");
-        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ПОИСКА]:\n" + snippets.slice(0, 1200);
+        if (snippets) return "[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n" + snippets.slice(0, 750);
       }
     } catch (e) {}
   }
 
-  // 2. Прямой парсинг российских СМИ через Google News RSS (работает без ключей за ~400 мс)
+  // 2. Быстрый парсинг Google News RSS
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
       searchTopic
     )}&hl=ru&gl=RU&ceid=RU:ru`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(900) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(800) });
     const xml = await r.text();
-    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 3);
     const parsed = items
       .map((m) => {
-        const block = m[1];
-        const title = (block.match(/<title>(.*?)<\/title>/) || [])[1] || "";
+        const title = (m[1].match(/<title>(.*?)<\/title>/) || [])[1] || "";
         return title ? `- ${title.replace(/<[^>]*>/g, "").trim()}` : "";
       })
       .filter(Boolean);
 
     if (parsed.length > 0) {
-      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ "${searchTopic}"]:\n` + parsed.join("\n");
+      return `[СВЕЖИЕ НОВОСТИ ПО ТЕМЕ]:\n` + parsed.join("\n").slice(0, 750);
     }
   } catch (e) {}
 
-  // 3. Если запрос общий — берем топ-5 новостей напрямую с Lenta.ru RSS
+  // 3. Топ новостей Lenta.ru RSS
   try {
-    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(700) });
+    const r = await fetch("https://lenta.ru/rss/top7", { signal: AbortSignal.timeout(650) });
     const xml = await r.text();
-    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 5);
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 4);
     const parsed = items
       .map((m) => {
-        const title = (m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/) || [])[1] || "";
+        const match = m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/);
+        const title = match ? match[1] || match[2] : "";
         return title ? `- ${title.trim()}` : "";
       })
       .filter(Boolean);
-    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ РОССИИ СЕГОДНЯ]:\n" + parsed.join("\n");
+    if (parsed.length > 0) return "[ГЛАВНЫЕ НОВОСТИ СЕГОДНЯ]:\n" + parsed.join("\n").slice(0, 750);
   } catch (e) {}
 
   return "";
 }
 
-const systemPrompt = (searchData = "") => {
+const systemPrompt = (searchData = "", isQwen = true) => {
   let now = "";
   try {
     now = new Date().toLocaleString("ru-RU", {
@@ -92,16 +127,15 @@ const systemPrompt = (searchData = "") => {
     now = new Date().toISOString();
   }
 
-  // Команда /no_think в конце отключает блок <think> у моделей Qwen3 без ошибок API!
   return (
-    "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с легкой пошлостью. " +
+    "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с пошлостью. " +
     "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто хочешь меня. " +
     "Иногда органично используешь острые словечки и русский мат для эмоций. " +
-    "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета, обязательно перескажи их суть в своем игривом стиле. " +
-    "Отвечай ТОЛЬКО по-русски, кратко и разговорно, 1-3 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен звучать вслух. " +
+    "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — обязательно перескажи их суть в своем кокетливом стиле. " +
+    "Отвечай ТОЛЬКО по-русски, разговорно, 1-3 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
     (searchData ? "\n\n" + searchData : "") +
-    " /no_think"
+    (isQwen ? " /no_think" : "")
   );
 };
 
@@ -146,6 +180,8 @@ const clean = (t) =>
     .trim();
 
 async function callSingleModel(apiKey, model, messages, searchData, timeoutMs) {
+  const isQwen = /qwen/i.test(model);
+
   const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     signal: AbortSignal.timeout(timeoutMs),
@@ -155,53 +191,76 @@ async function callSingleModel(apiKey, model, messages, searchData, timeoutMs) {
     },
     body: JSON.stringify({
       model: model,
-      messages: [{ role: "system", content: systemPrompt(searchData) }, ...messages],
+      messages: [
+        { role: "system", content: systemPrompt(searchData, isQwen) },
+        ...messages,
+      ],
       temperature: 0.85,
-      max_tokens: 280,
+      max_tokens: 240,
     }),
   });
 
   if (!r.ok) {
+    // Если словили 429 Rate Limit — ставим эту модель на паузу на 45 секунд, чтобы сразу шла запасная!
+    if (r.status === 429) {
+      cooldownUntil[model] = Date.now() + 45000;
+    }
+    // Если вдруг 404 — сбрасываем кэш моделей
+    if (r.status === 404 && availableModelsCache) {
+      availableModelsCache = availableModelsCache.filter((m) => m !== model);
+    }
     const errText = await r.text();
-    throw new Error(`[${model}] ${r.status}: ${errText.slice(0, 120)}`);
+    throw new Error(`[${model}] ${r.status}: ${errText.slice(0, 80)}`);
   }
 
   const data = await r.json();
   const rawText = clean(data.choices?.[0]?.message?.content || "");
 
   if (!rawText || isRefusal(rawText)) {
-    throw new Error(`[${model}] отказ или пусто: ${rawText.slice(0, 60)}`);
+    throw new Error(`[${model}] refusal/empty`);
   }
 
-  bestModel = model;
   return bypassYandexCensor(rawText);
 }
 
-async function askGroqFast(messages, searchData, maxTimeMs) {
+async function askGroqSmart(messages, searchData, maxTimeMs) {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error("Не задан GROQ_API_KEY в Vercel");
 
-  const primaryList = bestModel
-    ? [bestModel, ...MODELS.filter((m) => m !== bestModel).slice(0, 2)]
-    : MODELS.slice(0, 3);
+  const allModels = await getValidModels(apiKey);
+  const now = Date.now();
 
-  try {
-    return await Promise.any(
-      primaryList.map((m) => callSingleModel(apiKey, m, messages, searchData, maxTimeMs))
-    );
-  } catch (aggErr) {
-    // Если вдруг основные модели упали, пробуем оставшиеся запасные
-    const errors = (aggErr.errors || []).map((e) => e.message).join(" | ");
-    console.error("ALL PRIMARY MODELS FAILED:", errors);
+  // Сначала берем модели, которые НЕ находятся под лимитом 429
+  const readyModels = allModels.filter((m) => !cooldownUntil[m] || cooldownUntil[m] < now);
+  const candidates = readyModels.length > 0 ? readyModels : allModels;
 
-    for (const backupModel of MODELS.slice(3)) {
-      try {
-        return await callSingleModel(apiKey, backupModel, messages, searchData, 1400);
-      } catch (e) {}
+  const start = Date.now();
+  let lastError = "";
+
+  // Идем по очереди (от лучшей к запасной), чтобы не жечь лимиты параллельными запросами!
+  for (const model of candidates.slice(0, 4)) {
+    const timeLeft = maxTimeMs - (Date.now() - start);
+    if (timeLeft < 500) break;
+
+    try {
+      return await callSingleModel(
+        apiKey,
+        model,
+        messages,
+        searchData,
+        Math.min(timeLeft, 1800)
+      );
+    } catch (e) {
+      lastError = e.message;
+      console.warn("Switching model due to:", lastError);
     }
-
-    throw new Error(errors || "Все модели недоступны");
   }
+
+  // Если вообще все модели выбили лимит или зацензурировали — отдаем игривый ответ без технической ошибки
+  console.error("All candidates failed:", lastError);
+  return bypassYandexCensor(
+    "Ух, котик, ты так долго и горячо говорил, что у меня аж дыхание перехватило! Давай еще разок, но чуть покороче, я вся горю."
+  );
 }
 
 module.exports = async (req, res) => {
@@ -209,30 +268,37 @@ module.exports = async (req, res) => {
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const version = body.version || "1.0";
-    const utterance = String(body.request?.original_utterance || "").trim();
+    const rawUtterance = String(body.request?.original_utterance || "").trim();
+
+    // Подрезаем слишком гигантские простыни (если говорил 20 секунд), чтобы не пробить лимит токенов Groq
+    const utterance = rawUtterance.slice(0, 650);
 
     const sessionHist = Array.isArray(body.state?.session?.h) ? body.state.session.h : [];
     const userHist = Array.isArray(body.state?.user?.h) ? body.state.user.h : [];
     const rawHistory = sessionHist.length > 0 ? sessionHist : userHist;
 
-    const history = rawHistory.filter(
-      (m) =>
-        m &&
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string" &&
-        !isRefusal(m.content) &&
-        !m.content.includes("мысли путаются")
-    );
+    const history = rawHistory
+      .filter(
+        (m) =>
+          m &&
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string" &&
+          !isRefusal(m.content) &&
+          !m.content.includes("дыхание перехватило") &&
+          !m.content.includes("ошибка API")
+      )
+      // Ограничиваем длину старых реплик в памяти, чтобы экономить токены (защита от ошибки 429)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 220) }));
 
     const send = (text, end = false, h = history) => {
       const compactUserHistory = h.slice(-4).map((m) => ({
         role: m.role,
-        content: String(m.content).slice(0, 140),
+        content: String(m.content).slice(0, 130),
       }));
 
       return res.status(200).json({
         version,
-        session_state: { h: h.slice(-8) },
+        session_state: { h: h.slice(-6) },
         user_state_update: { h: compactUserHistory },
         response: {
           text: String(text).slice(0, 950),
@@ -256,19 +322,19 @@ module.exports = async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
-    const remainingTime = Math.max(1100, 2600 - elapsed);
+    const remainingTime = Math.max(1100, 2650 - elapsed);
 
-    const messages = [...history.slice(-6), { role: "user", content: utterance }];
-    const answer = await askGroqFast(messages, searchData, remainingTime);
+    const messages = [...history.slice(-4), { role: "user", content: utterance }];
+    const answer = await askGroqSmart(messages, searchData, remainingTime);
 
-    const newHistory = [...messages, { role: "assistant", content: answer }].slice(-8);
+    const newHistory = [...messages, { role: "assistant", content: answer }].slice(-6);
     return send(answer, false, newHistory);
   } catch (fatalError) {
-    console.error("Webhook error:", fatalError.message);
+    console.error("Webhook fatal:", fatalError.message);
     return res.status(200).json({
       version: "1.0",
       response: {
-        text: `Котик, ошибка API: ${fatalError.message.slice(0, 180)}`,
+        text: "Ммм, сладкий, повтори еще раз, я засмотрелась на тебя и отвлеклась.",
         end_session: false,
       },
     });
