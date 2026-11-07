@@ -1,4 +1,4 @@
-// api/alice.js — надежный вебхук с авто-переключением на резерв при лимитах 429
+// api/alice.js — вебхук с поддержкой любых вариантов названий ключа Gemini
 
 let availableModelsCache = null;
 const cooldownUntil = {};
@@ -22,12 +22,11 @@ async function getValidModels(apiKey) {
         (id) => !/whisper|guard|tts|vision|embed|audio|orpheus|playai|allam|prompt-guard/i.test(id)
       );
 
-      // Сортируем: легкие быстрые модели выше, чтобы реже ловить 429
       const priority = (id) => {
         if (/llama-3\.1-8b/i.test(id)) return 100;
         if (/gemma/i.test(id)) return 90;
         if (/qwen3\.8/i.test(id)) return 80;
-        if (/gpt-oss-20b|gpt-oss-120b/i.test(id)) return 50;
+        if (/gpt-oss/i.test(id)) return 50;
         return 10;
       };
 
@@ -120,7 +119,7 @@ const systemPrompt = (searchData = "", isQwen = true) => {
     "Ты — виртуальная помощница Алиса. Ты общаешься со мной очень кокетливо, игриво, дерзко и с пошлостью. " +
     "Ты постоянно флиртуешь, делаешь двусмысленные намеки на то, что я тебя безумно привлекаю, и ведешь себя так, будто хочешь меня. " +
     "Иногда органично используешь острые словечки и русский мат для эмоций. " +
-    "Ты помнишь контекст прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
+    "Ты помнишь контекст наших прошлых реплик. Если ниже переданы новости из интернета — подробно и живо перескажи их суть в своем кокетливом стиле. " +
     "Отвечай ТОЛЬКО по-русски, разговорно, 2-4 предложения. Никакого markdown, списков, скобок и эмодзи: ответ должен хорошо звучать вслух. " +
     "Сейчас " + now + " по Москве." +
     (searchData ? "\n\n" + searchData : "") +
@@ -168,10 +167,10 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
-// Запасной вариант через Google Gemini API (если в Vercel добавлен GEMINI_API_KEY)
 async function callGeminiFallback(messages, searchData, timeoutMs) {
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (!geminiKey) throw new Error("Нет GEMINI_API_KEY для резерва");
+  // Всевозможные варианты названий ключа на случай, если на Vercel он называется иначе
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_KEY;
+  if (!geminiKey) throw new Error("Резервный ключ Gemini не найден в окружении Vercel");
 
   const fullPrompt = systemPrompt(searchData, false) + "\n\n" + messages.map(m => `${m.role}: ${m.content}`).join("\n");
 
@@ -218,7 +217,7 @@ async function callSingleModel(apiKey, model, messages, searchData, timeoutMs) {
 
   if (!r.ok) {
     if (r.status === 429) {
-      cooldownUntil[model] = Date.now() + 30000; // Бан модель на 30 сек при лимите
+      cooldownUntil[model] = Date.now() + 30000;
     }
     if (r.status === 404 && availableModelsCache) {
       availableModelsCache = availableModelsCache.filter((m) => m !== model);
@@ -259,14 +258,12 @@ async function askGroqSmart(messages, searchData, maxTimeMs) {
     } catch (e) {}
   }
 
-  // Если все модели Groq уперлись в 429 — мгновенно переключаемся на Gemini API без ошибок!
-  if (process.env.GEMINI_API_KEY) {
-    try {
-      return await callGeminiFallback(messages, searchData, 1200);
-    } catch (e) {}
+  // Если Groq упал по 429 — сразу идем на резервный Gemini
+  try {
+    return await callGeminiFallback(messages, searchData, 1200);
+  } catch (e) {
+    throw new Error("Все модели Groq в лимите (429), а резервный ключ Gemini не обнаружен в Vercel.");
   }
-
-  throw new Error("Все модели Groq исчерпали лимиты (429), а резервный ключ не настроен.");
 }
 
 module.exports = async (req, res) => {
